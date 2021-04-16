@@ -248,3 +248,131 @@ class Batch:
 
 * Dataclasses are great for Value Objects
 
+Whenever we have a business concept that has data but no identity, we often choose to represent it using the Value Object pattern. A value object is any domain object that is uniquely identified by the data it holds; we usually make them immutable:
+
+#+BEGIN_SRC python
+# OrderLine is a value object
+@dataclass(frozen = True)
+class OrderLine:
+    orderid: OrderReference
+    sku: ProductReference
+    qty: Quantity
+#+END_SRC
+
+dataclasses give us value equality, i.e. two lines with the same orderid, sku and qty are equal
+
+#+BEGIN_SRC python
+from dataclasses import dataclass
+from typing import NamedTuple
+from collections import namedtuple
+
+
+@dataclass(frozen = True)
+class Name:
+    first_name: str
+    surname: str
+
+    
+class Money(NamedTuple):
+    currency: str
+    value: int
+
+    
+Line = namedtuple('Line', ['sku', 'qty'])
+
+
+def test_equality():
+    assert Money('gbp', 10) == Money('gbp', 10)
+    assert Name('Harry', 'Percival') != Name('Bob', 'Gregory')
+    assert Line('RED-CHAIR', 5) == Line('RED-CHAIR', 5)
+
+print(test_equality())
+#+END_SRC
+
+#+BEGIN_SRC python
+# add mathematical operators
+fiver = Money('gbp', 5)
+tenner = Money('gbp', 10)
+
+
+def can_add_money_values_for_the_same_currency():
+    assert fiver + fiver == tenner
+
+    
+def can_subtract_money_values():
+    return assert tenner - fiver == fiver
+
+
+def adding_different_currencies_fails():
+    with pytest.raises(ValueError):
+        Money('usd', 10) + Money('gbp', 10)
+
+
+def can_multiply_money_by_a_number():
+    assert fiver * 5 == Money('gbp', 25)
+
+
+def multiplying_two_values_is_an_error():
+    with pytest.raises(TypeError):
+        tenner * fiver
+#+END_SRC
+
+To get the tests above to pass, we need to implement some magic methods on our Money class:
+
+#+BEGIN_SRC python
+@dataclass(frozen = True)
+class Money:
+    currency: str
+    value: int
+
+    def __add__(self, other) -> Money:
+        if other.currency != self.currency:
+            raise ValueError(f"Cannot add {self.currency} to {other.currency}")
+        return Money(self.currency, self.value + other.value)
+
+    def __sub__(self, others) -> Money:
+        if other.currency != self.currency:
+            raise ValueError(f"Cannot add {self.currency} to {other.currency}")
+        return Money(self.currency, self.value - other.value)
+
+    def __mult__(self, others) -> Money:
+        raise TypeError(f"Cannot multiply currency")
+#+END_SRC
+
+* Value Objects and Entities
+
+We use the term entity to describe a domain object that has a long lived identity. 
+  
+#+BEGIN_SRC python
+def test_name_equality():
+    assert Name("Harry", "Percival") != Name("Barry", "Percival")
+
+# humans have a persistent identity regardless of descriptors
+class Person:
+    def __init__(self, name: Name):
+        self.name = name
+
+def test_barry_is_harry():
+    harry, barry = Person(Name("Harry", "Percival")), harry
+    barry.name = Name("Barry", "Percival")
+
+    assert harry is barry and barry is harry
+#+END_SRC
+
+Entities, unlike values, have identity equality. We can change their values, but they are recognizably the same thing
+We can make this explicit by implementing equality operators on entities:
+
+#+BEGIN_SRC python
+class Batch:
+    # ...
+    # defines behavior of the class for the == operator
+    def __eq__(self, other):
+        if not ininstance(other, Batch):
+            return False
+        return other.reference == self.reference
+
+    # defines the behavior Python uses when adding the obj to sets or using them as dict keys
+    def __hash__(self):
+        return hash(self.reference)
+#+END_SRC
+

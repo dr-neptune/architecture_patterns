@@ -1,0 +1,139 @@
+#+TITLE: Pytest Tutorial
+
+https://semaphoreci.com/community/tutorials/testing-python-applications-with-pytest
+
+* Basic Pytest Usage
+
+#+BEGIN_SRC python
+print("Hello, World")
+#+END_SRC
+
+Python expects our tests to be located in a file whose names begin with test_ or end with _test.py
+
+#+BEGIN_SRC python :results output :tangle ~/Documents/architecture_patterns/test_capitalize.py
+import pytest
+
+def capital_case(x):
+    if not isinstance(x, str):
+        raise TypeError('Please provide a string argument')
+    return x.capitalize()
+
+def test_capital_case():
+    assert capital_case('beetles') == 'Beetles'
+
+def test_raises_exception_on_non_string_arguments():
+    with pytest.raises(TypeError):
+        capital_case(9)
+#+END_SRC
+
+* Using Pytest Fixtures
+
+#+BEGIN_SRC python
+import pytest
+from wallet import Wallet, InsufficientAmount
+
+
+def test_default_initial_amount():
+    wallet = Wallet()
+    assert wallet.balance == 0
+
+    
+def test_setting_initial_amount():
+    wallet = Wallet(100)
+    assert wallet.balance == 100
+
+    
+def test_wallet_add_cash():
+    wallet = Wallet(10)
+    wallet.add_cash(90)
+    assert wallet.balance == 100
+    
+def test_wallet_spend_cash():
+    wallet = Wallet(20)
+    wallet.spend_cash(10)
+    assert wallet.balance == 10
+
+
+def test_wallet_spend_cash_raises_exception_on_insufficient_amount():
+    wallet = Wallet()
+    with pytest.raises(InsufficientAmount):
+        wallet.spend_cash(100)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle ~/Documents/architecture_patterns/wallet.py
+class InsufficientAmount(Exception):
+    pass
+
+class Wallet(object):
+    def __init__(self, initial_amount = 0):
+        self.balance = initial_amount
+
+    def spend_cash(self, amount):
+        if self.balance < amount:
+            raise InsufficientAmount('Not enough available to spend {}'.format(amount))
+        self.balance -= amount
+
+    def add_cash(self, amount):
+        self.balance += amount
+#+END_SRC
+
+* Refactoring our Tests with Fixtures
+
+Instead of repeating ourselves initializing objects, we can use pytest fixtures.
+
+#+BEGIN_SRC python :tangle ~/Documents/architecture_patterns/test_wallet.py
+import pytest
+from wallet import Wallet, InsufficientAmount
+
+
+@pytest.fixture
+def empty_wallet():
+    '''Returns a wallet instance with a zero balance'''
+    return Wallet()
+
+
+@pytest.fixture
+def wallet():
+    '''Returns a wallet instance with a balance of 20'''
+    return Wallet(20)
+
+
+def test_default_initial_amount(empty_wallet):
+    return empty_wallet.balance == 0
+
+
+def test_setting_initial_amount(wallet):
+    assert wallet.balance == 20
+
+
+def test_wallet_add_cash(wallet):
+    wallet.add_cash(80)
+    assert wallet.balance == 100
+
+
+def test_wallet_spend_cash(wallet):
+    wallet.spend_cash(10)
+    assert wallet.balance == 10
+
+
+def test_wallet_spend_cash_raises_exception_on_insufficient_amount(empty_wallet):
+    with pytest.raises(InsufficientAmount):
+        empty_wallet.spend_cash(100)
+
+# parameterized test functions
+# combining test fixtures and parameterized test functions
+@pytest.fixture
+def my_wallet():
+    '''returns a wallet instance with a zero balance'''
+    return Wallet()
+
+@pytest.mark.parametrize("earned, spent, expected", [
+    (30, 10, 20),
+    (20, 2, 18),
+])
+
+def test_transactions(my_wallet, earned, spent, expected):
+    my_wallet.add_cash(earned)
+    my_wallet.spend_cash(spent)
+    assert my_wallet.balance == expected
+#+END_SRC
