@@ -1,0 +1,64 @@
+#+TITLE: Introduction
+
+* Why Do Our Designs Go Wrong?
+
+When different parts of the program do many things, we end up with a big ball of mud.
+
+* Encapsulation and Abstractions
+
+The term encapsulation covers two closely related ideas: simplifying behavior and hiding data.
+
+#+BEGIN_SRC python
+# do a search with urllib
+import json
+from urllib.request import urlopen
+from urllib.parse import urlencode
+
+params = dict(q = 'Sausages', format = 'json')
+handle = urlopen('https://api.duckduckgo.com' + '?' + urlencode(params))
+raw_text = handle.read().decode('utf8')
+parsed = json.loads(raw_text)
+
+print(parsed)
+
+results = parsed['RelatedTopics']
+
+for r in results:
+    if 'Text' in r:
+        print(r['FirstURL'] + ' - ' + r['Text'])   
+#+END_SRC
+
+#+BEGIN_SRC python
+# do a search with requests
+import requests
+
+params = dict(q = 'Sausages', format = 'json')
+parsed = requests.get('https://api.duckduckgo.com/', params = params).json()
+
+results = parsed['RelatedTopics']
+
+for r in results:
+    if 'Text' in r:
+        print(r['FirstURL'] + ' - ' + r['Text'])   
+#+END_SRC
+
+#+BEGIN_SRC python
+# do it at a higher abstraction level
+import duckduckpy
+
+for r in duckduckpy.query('Sausages').related_topics:
+    print(r.first_url, ' - ', r.text)
+#+END_SRC
+
+* Layering
+
+Most business software looks like:
+
+Presentation Layer -> Business Logic -> Database Layer
+
+* The Dependency Inversion Principle
+
+Formal definition:
+
+1. High level modules should not depend on low level modules. Both should depend on abstractions
+2. Abstractions should not depend on details. Instead, details should depend on abstractions
