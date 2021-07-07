@@ -281,5 +281,183 @@ The end result will be that, if we call start_mappers, we will be able to easily
 If we never call that function, our domain model classes stay blissfully unaware of the database.
 
 #+BEGIN_SRC python :tangle test_orm.py
+import model
+
+
+def test_orderline_mapper_can_load_lines(session):
+    session.execute(
+        "INSERT INTO order_lines (orderid, sku, qty) VALUES "
+        '("order1", "RED-CHAIR", 12)'
+        '("order1", "RED-TABLE", 13)'
+        '("order2", "BLUE-LIPSTICK", 14)'
+    )
+    expected = [
+        model.OrderLine("order1", "RED-CHAIR", 12),
+        model.OrderLine("order1", "RED-CHAIR", 13),
+        model.OrderLine("order2", "BLUE-LIPSTICK", 14),
+    ]
+    assert session.query(model.OrderLine).all() == expected
+
+def test_orderline_mapper_can_save_lines(session):
+    new_line = model.OrderLine("order1", "DECORATIVE-WIDGET", 12)
+    session.add(new_line)
+    session.commit()
+
+    rows = list(session.execute('SELECT orderid, sku, qty FROM "order_lines"'))
+    assert rows == [("order1", "DECORATIVE-WIDGET", 12)]
+#+END_SRC
+
+At this point, our API endpoint might look something like this (using SQLAlchemy directly in our API endpoint):
+
+#+BEGIN_SRC python
+import flask
+
+@flask.route.gubbins
+def allocate_endpoint():
+    session = start_session()
+
+    # extract order line from request
+    line = OrderLine(
+        request.json['orderid'],
+        request.json['sku'],
+        request.json['qty'],
+    )
+
+    # load all batches from the DB
+    batches = session.query(Batch).all()
+
+    # call our domain service
+    allocate(line, batches)
+
+    # save the allocation back to the database
+    session.commit()
+
+    return 201
+
+
+# updated after add a SqlAlchemyRespository
+@flask.route.gubbins
+def allocate_endpoint():
+    batches = SqlAlchemyRepository.list()
+    lines = [
+        OrderLine(l['orderid'], l['sku'], l['qty'])
+        for l in request.params
+    ]
+    allocate(lines, batches)
+    session.commit()
+    return 201
+#+END_SRC
+
+* Introducing the Repository Pattern
+
+The Repository pattern is an abstraction over persistent storage. It hides the boring details of data access by pretending that
+all of our data is in memory. If we had infinite memory in our laptops, we'd have no need for databases. Instead we could just
+use our objects whenever we liked. What would that look like?
+
+* The Repository in the Abstract
+
+The simplest repository has just two methods: add() to put a new item in the repository, and get() to return a previously added item.
+
+#+BEGIN_SRC python :tangle repository.py
+import abc
+
+class AbstractRepository(abc.ABC):
+    @abc.abstractmethod
+    def add(self, batch: model.Batch):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get(self, reference) -> model.Batch:
+        raise NotImplementedError
+
+
+class SqlAlchemyRepository(AbstractRepository):
+    def __init__(self, session):
+        self.session = session
+
+    def add(self, reference):
+        self.session.add(batch)
+
+    def get(self, reference):
+        return self.session.query(model.Batch).filter_by(reference=reference).one()
+
+    def list(self):
+        return self.session.query(model.Batch).all()
+
+
+class FakeRepository(AbstractRepository):
+    def __init__(self, batches):
+        self._batches = set(batches)
+
+    def add(self, batch):
+        self._batches.add(batch)
+
+    def get(self, reference):
+        return next(b for b in self._batches if b.reference == reference)
+
+    def list(self):
+        return list(self._batches)
+
+#+END_SRC
+
+* What is the Trade-Off?
+
+We are introducing a new layer of abstraction. While we hope it will reduce complexity overall, it does add complexity locally, and it has a cost in terms of the raw numbers of moving parts and ongoing maintenance.
+
+As far as the code is concerned, we are really just swapping the SQLAlchemy abstraction (session.query(Batch)) for a different one (batches_repo.get) that we designed.
+
+We will have to write a few lines of code in our repository class each time we add a new domain object that we want to retrieve, but in return we get a simple abstraction over our storage layer, which we control. The Repository pattern makes it easy to make fundamental changes to the way we store things and is also easy to fake out for unit tests.
+
+#+BEGIN_SRC python :tangle test_repository.py
+# integration test to check that our repository is correctly integrated with the database
+def test_repository_can_save_a_batch(session):
+    batch = model.Batch("batch1", "RUSTY-SOAPDISH", 100, eta=None)
+
+    repo = repository.SqlAlchemyRepository(session)
+    repo.add(batch)  # this is the method under test here
+    session.commit()  # this is the responsibility of the caller
+
+    # uses the raw sql to verify the right data has been saved
+    rows = session.execute(
+        'SELECT reference, sku, _purchased_quantity, eta FROM "batches"'
+    )
+    assert list(rows) == [("batch1", "RUSTY-SOAPDISH", 100, None)]
+
+
+def insert_order_line(session):
+    session.execute(  # tests the read side, so the raw SQL is preparing data to be read by the repo.get()
+        "INSERT INTO order_lines (orderid, sku, qty)"
+        ' VALUES ("order1", "GENERIC-SOFA", 12)'
+    )
+    [[orderline_id]] = session.execute(
+        "SELECT id FROM order_lines WHERE orderid=:orderid AND sku=:sku",
+        dict(orderid="order1", sku="GENERIC-SOFA"),
+    )
+    return orderline_id
+
+
+def insert_batch(session, batch_id):
+    # ...
+    pass
+
+
+def test_repository_can_retrieve_a_batch_with_allocations(session):
+    orderline_id = insert_order_line(session)
+    batch1_id = insert_batch(session, "batch1")
+    insert_batch(session, "batch2")
+    insert_allocation(session, orderline_id, batch1_id)
+
+    repo = repository.SqlAlchemyRepository(session)
+    retrieved = repo.get("batch1")
+
+    expected = model.Batch("batch1", "GENERIC-SOFA", 100, eta=None)
+    assert retrieved == expected  # Batch.__eq__ only compares reference
+    assert retrieved.sku == expected.sku
+    assert retrieved._purchased_quantity == expected._purchased_quantity
+    assert retrieved._allocations == {
+        model.OrderLine("order1", "GENERIC-SOFA", 12)
+    }
+
+
 
 #+END_SRC
