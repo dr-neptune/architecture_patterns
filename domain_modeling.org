@@ -131,8 +131,8 @@ def test_cannot_allocate_if_available_smaller_than_required():
 def test_can_allocate_if_available_equal_to_required():
     batch, line = make_batch_and_line("ELEGANT-LAMP", 2, 2)
     assert batch.can_allocate(line)
-    
-    
+
+
 # def test_cannot_allocate_to_the_same_line_twice():
 #     batch = Batch(reference = "batch-001",
 #                   sku = "SMALL-TABLE",
@@ -165,7 +165,7 @@ def test_allocation_is_idempotent():
     batch.allocate(line)
     batch.allocate(line)
     assert batch.available_quantity == 18
-    
+
 def test_prefers_warehouse_batches_to_shipments():
     pytest.fail("todo")
 
@@ -272,12 +272,12 @@ class Name:
     first_name: str
     surname: str
 
-    
+
 class Money(NamedTuple):
     currency: str
     value: int
 
-    
+
 Line = namedtuple('Line', ['sku', 'qty'])
 
 
@@ -298,7 +298,7 @@ tenner = Money('gbp', 10)
 def can_add_money_values_for_the_same_currency():
     assert fiver + fiver == tenner
 
-    
+
 def can_subtract_money_values():
     return assert tenner - fiver == fiver
 
@@ -341,8 +341,8 @@ class Money:
 
 * Value Objects and Entities
 
-We use the term entity to describe a domain object that has a long lived identity. 
-  
+We use the term entity to describe a domain object that has a long lived identity.
+
 #+BEGIN_SRC python
 def test_name_equality():
     assert Name("Harry", "Percival") != Name("Barry", "Percival")
@@ -374,13 +374,4 @@ class Batch:
     # defines the behavior Python uses when adding the obj to sets or using them as dict keys
     def __hash__(self):
         return hash(self.reference)
-#+END_SRC
-
-
-
-
-
-
-#+BEGIN_SRC python
-
 #+END_SRC
