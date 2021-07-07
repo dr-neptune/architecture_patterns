@@ -1,1 +1,285 @@
 #+TITLE: Repository Pattern
+
+The repository pattern is a simplifying abstraction over data storage, allowing us to decouple our model layer from the data layer.
+
+Previously, on ADP-Z:
+
+#+BEGIN_SRC python :tangle model.py
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import date
+from typing import Optional, List, Set
+
+
+class OutOfStock(Exception):
+    pass
+
+
+def allocate(line: OrderLine, batches: List[Batch]) -> str:
+    try:
+        batch = next(b for b in sorted(batches) if b.can_allocate(line))
+        batch.allocate(line)
+        return batch.reference
+    except StopIteration:
+        raise OutOfStock(f"Out of stock for sku {line.sku}")
+
+
+@dataclass(unsafe_hash=True)
+class OrderLine:
+    orderid: str
+    sku: str
+    qty: int
+
+
+class Batch:
+    def __init__(self, ref: str, sku: str, qty: int, eta: Optional[date]):
+        self.reference = ref
+        self.sku = sku
+        self.eta = eta
+        self._purchased_quantity = qty
+        self._allocations = set()  # type: Set[OrderLine]
+
+    def __repr__(self):
+        return f"<Batch {self.reference}>"
+
+    def __eq__(self, other):
+        if not isinstance(other, Batch):
+            return False
+        return other.reference == self.reference
+
+    def __hash__(self):
+        return hash(self.reference)
+
+    def __gt__(self, other):
+        if self.eta is None:
+            return False
+        if other.eta is None:
+            return True
+        return self.eta > other.eta
+
+    def allocate(self, line: OrderLine):
+        if self.can_allocate(line):
+            self._allocations.add(line)
+
+    def deallocate(self, line: OrderLine):
+        if line in self._allocations:
+            self._allocations.remove(line)
+
+    @property
+    def allocated_quantity(self) -> int:
+        return sum(line.qty for line in self._allocations)
+
+    @property
+    def available_quantity(self) -> int:
+        return self._purchased_quantity - self.allocated_quantity
+
+    def can_allocate(self, line: OrderLine) -> bool:
+        return self.sku == line.sku and self.available_quantity >= line.qty
+#+END_SRC
+
+#+BEGIN_SRC python :tangle test_allocate.py
+from datetime import date, timedelta
+import pytest
+from model import allocate, OrderLine, Batch, OutOfStock
+
+today = date.today()
+tomorrow = today + timedelta(days=1)
+later = tomorrow + timedelta(days=10)
+
+
+def test_prefers_current_stock_batches_to_shipments():
+    in_stock_batch = Batch("in-stock-batch", "RETRO-CLOCK", 100, eta=None)
+    shipment_batch = Batch("shipment-batch", "RETRO-CLOCK", 100, eta=tomorrow)
+    line = OrderLine("oref", "RETRO-CLOCK", 10)
+
+    allocate(line, [in_stock_batch, shipment_batch])
+
+    assert in_stock_batch.available_quantity == 90
+    assert shipment_batch.available_quantity == 100
+
+
+def test_prefers_earlier_batches():
+    earliest = Batch("speedy-batch", "MINIMALIST-SPOON", 100, eta=today)
+    medium = Batch("normal-batch", "MINIMALIST-SPOON", 100, eta=tomorrow)
+    latest = Batch("slow-batch", "MINIMALIST-SPOON", 100, eta=later)
+    line = OrderLine("order1", "MINIMALIST-SPOON", 10)
+
+    allocate(line, [medium, earliest, latest])
+
+    assert earliest.available_quantity == 90
+    assert medium.available_quantity == 100
+    assert latest.available_quantity == 100
+
+
+def test_returns_allocated_batch_ref():
+    in_stock_batch = Batch("in-stock-batch-ref", "HIGHBROW-POSTER", 100, eta=None)
+    shipment_batch = Batch("shipment-batch-ref", "HIGHBROW-POSTER", 100, eta=tomorrow)
+    line = OrderLine("oref", "HIGHBROW-POSTER", 10)
+    allocation = allocate(line, [in_stock_batch, shipment_batch])
+    assert allocation == in_stock_batch.reference
+
+
+def test_raises_out_of_stock_exception_if_cannot_allocate():
+    batch = Batch("batch1", "SMALL-FORK", 10, eta=today)
+    allocate(OrderLine("order1", "SMALL-FORK", 10), [batch])
+
+    with pytest.raises(OutOfStock, match="SMALL-FORK"):
+        allocate(OrderLine("order2", "SMALL-FORK", 1), [batch])
+#+END_SRC
+
+#+BEGIN_SRC python :tangle test_batches.py
+from datetime import date
+from model import Batch, OrderLine
+
+
+def test_allocating_to_a_batch_reduces_the_available_quantity():
+    batch = Batch("batch-001", "SMALL-TABLE", qty=20, eta=date.today())
+    line = OrderLine("order-ref", "SMALL-TABLE", 2)
+
+    batch.allocate(line)
+
+    assert batch.available_quantity == 18
+
+
+def make_batch_and_line(sku, batch_qty, line_qty):
+    return (
+        Batch("batch-001", sku, batch_qty, eta=date.today()),
+        OrderLine("order-123", sku, line_qty),
+    )
+
+
+def test_can_allocate_if_available_greater_than_required():
+    large_batch, small_line = make_batch_and_line("ELEGANT-LAMP", 20, 2)
+    assert large_batch.can_allocate(small_line)
+
+
+def test_cannot_allocate_if_available_smaller_than_required():
+    small_batch, large_line = make_batch_and_line("ELEGANT-LAMP", 2, 20)
+    assert small_batch.can_allocate(large_line) is False
+
+
+def test_can_allocate_if_available_equal_to_required():
+    batch, line = make_batch_and_line("ELEGANT-LAMP", 2, 2)
+    assert batch.can_allocate(line)
+
+
+def test_cannot_allocate_if_skus_do_not_match():
+    batch = Batch("batch-001", "UNCOMFORTABLE-CHAIR", 100, eta=None)
+    different_sku_line = OrderLine("order-123", "EXPENSIVE-TOASTER", 10)
+    assert batch.can_allocate(different_sku_line) is False
+
+
+def test_allocation_is_idempotent():
+    batch, line = make_batch_and_line("ANGULAR-DESK", 20, 2)
+    batch.allocate(line)
+    batch.allocate(line)
+    assert batch.available_quantity == 18
+
+
+def test_deallocate():
+    batch, line = make_batch_and_line("EXPENSIVE-FOOTSTOOL", 20, 2)
+    batch.allocate(line)
+    batch.deallocate(line)
+    assert batch.available_quantity == 20
+
+
+def test_can_only_deallocate_allocated_lines():
+    batch, unallocated_line = make_batch_and_line("DECORATIVE-TRINKET", 20, 2)
+    batch.deallocate(unallocated_line)
+    assert batch.available_quantity == 20
+
+#+END_SRC
+
+* Persisting Our Domain Model
+
+If we needed to run a database or an API and create test data, our tests would be harder to write and maintain.
+
+For the next few chapters we're going to look at how we can connect our idealized domain model to external state.
+
+We'll need a way to retrieve batch info from the database and instantiate our domain model objects from it,
+and we'll also need a way of saving them back to the database.
+
+* Applying the Dependency Inversion Principle to Data Access
+
+A layered architecture is a common approach to structuring a system that has a UI, some logic, and a database.
+The aim is to keep the layers separate and to have each layer depend only on the one below it.
+We want our domain model to have no dependencies whatsoever. We don't want infrastructure concerns bleeding over
+into our domain model and slowing our unit tests or our ability to make changes.
+
+* Our Current Model
+
+An allocation is the concept of linking an OrderLine to a Batch. We're storing the allocations as a collection on our Batch object.
+
+#+DOWNLOADED: /tmp/screenshot.png @ 2021-07-07 08:44:26
+[[file:Our Current Model/screenshot_2021-07-07_08-44-26.png]]
+
+Let's see how we might translate this to a relational database
+
+* The "Normal" ORM Way: Model Depends on ORM
+
+Object Relational Mappers (ORMs) exist to bridge the conceptual gap between the world of objects and domain modeling and the world
+of databases and relational algebra. The most important thing an ORM gives us is _persistence ignorance_: the idea that our fancy domain
+model doesn't need to know anything about how data is loaded or persisted. This helps keep our domain clean of direct dependencies on
+particular database technologies.
+
+If we follow the typical SQLAlchemy tutorial, we end up with something like this:
+
+#+BEGIN_SRC python
+from sqlalchemy import Column, ForeignKey, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+
+Base = declarative_base()
+
+class Order(Base):
+    id = Column(Integer, primary_key=True)
+
+class OrderLine(Base):
+    id = Column(Integer, primary_key=True)
+    sku = Column(String(250))
+    qty = Integer(String(250))
+    order_id = Column(Integer, ForeignKey('order.id'))
+    order = relationship(Order)
+
+class Allocation(Base):
+    # etc etc
+    pass
+#+END_SRC
+
+This doesn't do a good job at separating the domain layer from the persistence layer.
+
+* Inverting the Dependency: ORM Depends on Model
+
+The alternative way to to use SQLAlchemy is to define our schema separately, and to define an explicit mapper for how to convert between the schema and our domain model. This is what SQLAlchemy calls a classical mapping:
+
+#+BEGIN_SRC python :tangle orm.py
+from sqlalchemy.orm import mapper, relationship
+import model
+
+metadata = MetaData()
+
+order_lines = Table(
+    "order_lines",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("sku", String(255)),
+    Column("qty", Integer, nullable=False),
+    Column("orderid", String(255))
+)
+
+# ... other stuff here ...
+
+def start_mappers():
+    lines_mapper = mapper(model.OrderLine, order_lines)
+#+END_SRC
+
+1. The ORM imports (or depends on, or knows about) the domain model, and not the other way around
+2. We define our database tables and columns by using SQLAlchemy's abstractions
+3. When we call the mapper function, SQLAlchemy does its magic to bind our domain model classes to the various tables we've defined
+
+The end result will be that, if we call start_mappers, we will be able to easily load and save domain model instances from and to the database.
+If we never call that function, our domain model classes stay blissfully unaware of the database.
+
+#+BEGIN_SRC python :tangle test_orm.py
+
+#+END_SRC
