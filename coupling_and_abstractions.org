@@ -1,0 +1,118 @@
+#+TITLE: A Brief Interlude: On Coupling and Abstractions
+
+A key theme in this book is that we can use simple abstractions to hide messy details.
+When we're unable to change component A for fear of breaking component B, we say the components have become coupled.
+We can reduce the degree of coupling within a system by abstracting away the details.
+
+
+#+DOWNLOADED: /tmp/screenshot.png @ 2021-07-08 08:35:10
+[[file:screenshot_2021-07-08_08-35-10.png]]
+
+* Abstracting State Aids Testability
+
+Let's say we want to write code for synchronizing two file directories, a source and a destination.
+
+- If a file exists in the source but not the destination copy the file over
+- If a file exists in the source, but it has a different name than in the destination, rename the destination file to match
+- If a file exists in the destination but not in the source, remove it
+
+To detect renames we'll have to inspect the content of the files. For this, we can use a hashing function like MD5 or SHA-1.
+
+#+BEGIN_SRC python :tangle sync.py
+import hashlib
+import os
+import shutil
+from pathlib import Path
+
+
+BLOCKSIZE = 65536
+
+
+def hash_file(path):
+    hasher = hashlib.sha1()
+    with path.open("rb") as file:
+        buf = file.read(BLOCKSIZE)
+        while buf:
+            hasher.update(buf)
+            buf = file.read(BLOCKSIZE)
+    return hasher.hexdigest()
+
+
+def sync(source, dest):
+    # Walk the source folder and build a dict of filenames and their hashes
+    source_hashes = {}
+    for folder, _, files in os.walk(source):
+        for fn in files:
+            source_hashes[hash_file(Path(folder) / fn)] = fn
+
+    seen = set()  # Keep track of the files we've found in the target
+
+    # Walk the target folder and get the filenames and hashes
+    for folder, _, files in os.walk(dest):
+        for fn in files:
+            dest_path = Path(folder) / fn
+            dest_hash = hash_file(dest_path)
+            seen.add(dest_hash)
+
+            # if there's a file in target that's not in source, delete it
+            if dest_hash not in source_hashes:
+                dest_path.remove()
+
+            # if there's a file in target that has a different path in source
+            # move it to the correct path
+            elif dest_hash in source_hashes and fn != source_hashes[dest_hash]:
+                shutil.move(dest_path, Path(folder) / source_hashes[dest_hash])
+
+    # for every file that appears in the source, but not the target, copy the file to target
+    for src_hash, fn in source_hashes.items():
+        if src_hash not in seen:
+            shutil.copy(Path(source) / fn, Path(dest) / fn)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle test_sync.py
+import tempfile
+from pathlib import Path
+import shutil
+from sync import sync
+
+
+def test_when_a_file_exists_in_the_source_but_not_the_destination():
+    try:
+        source = tempfile.mkdtemp()
+        dest = tempfile.mkdtemp()
+
+        content = "I am a very useful file"
+        (Path(source) / "my-file").write_text(content)
+
+        sync(source, dest)
+
+        expected_path = Path(dest) / "my-file"
+        assert expected_path.exists()
+        assert expected_path.read_text() == content
+
+    finally:
+        shutil.rmtree(source)
+        shutil.rmtree(dest)
+
+
+def test_when_a_file_has_been_renamed_in_the_source():
+    try:
+        source = tempfile.mkdtemp()
+        dest = tempfile.mkdtemp()
+
+        content = "I am a file that was renamed"
+        source_path = Path(source) / "source-filename"
+        old_dest_path = Path(dest) / "dest-filename"
+        expected_dest_path = Path(dest) / "source-filename"
+        source_path.write_text(content)
+        old_dest_path.write_text(content)
+
+        sync(source, dest)
+
+        assert old_dest_path.exists() is False
+        assert expected_dest_path.read_text() == content
+
+    finally:
+        shutil.rmtree(source)
+        shutil.rmtree(dest)
+#+END_SRC
