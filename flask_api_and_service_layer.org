@@ -1,1 +1,89 @@
 #+TITLE: Our First Use Case: Flask API and Service Layer
+
+In this chapter, we discuss the differences between orchestration logic, business logic, and interfacing code, and we introduce the *Service Layer* pattern to take care of orchestrating our workflows and defining the use cases of our system.
+
+The service layer will become the main way into our app. We're going to add a Flask API that will talk to the service layer, which will service as the entrypoint to our domain model.
+
+Here is our plan:
+
+1. Use Flask to put an API endpoint in front of our allocate domain service. Wire up the database session and our repository. Test it with an end to end test and some quick and dirty SQL to prepare test data
+2. Refactor out a service layer that can serve as an abstraction to capture the use case and that will sit between Flask and our domain model. Build some service layer tests and show how they can use FakeRepository.
+3. Experiment with different types of parameters for our service layer functions; show that using primitive data types allows the service layer's clients (our tests and our Flask API) to be decoupled from the model layer.
+
+* A First End-to-End Test
+
+#+BEGIN_SRC python :tangle test_api.py
+@pytest.mark.usefixtures("restart_api")
+def test_api_returns_allocation(add_stock):
+    sku, othersku = random_sku(), random_sku("other")
+    earlybatch, laterbatch, otherbatch = random_batchref(1), random_batchref(2), random_batchref(3)
+
+    add_stock([
+        (laterbatch, sku, 100, "2011-01-02"),
+        (earlybatch, sku, 100, "2011-01-01"),
+        (otherbatch, othersku, 100, None),
+    ])
+
+    data = {"orderid": random_orderid(), "sku": sku, "qty": 3}
+    url = config.get_api_url()
+
+    r = requests.post(f"{url}/allocate", json=data)
+    assert r.status_code == 201
+    assert r.json()["batchref"] == earlybatch
+
+
+@pytest.mark.usefixtures("restart_api")
+def test_allocations_are_persisted(add_stock):
+    sku = random_sku()
+    batch1, batch2 = random_batchref(1), random_batchref(2)
+    order1, order2 = random_orderid(1), random_orderid(2)
+    add_stock(
+        [(batch1, sku, 10, "2011-01-01"),
+         (batch2, sku, 10, "2011-01-02")]
+    )
+    line1 = {"orderid": order1, "sku": sku, "qty": 10}
+    line2 = {"orderid": order2, "sku": sku, "qty": 10}
+    url = config.get_api_url()
+
+    # first order uses up all stock in batch 1
+    r = requests. post(f"{url}/allocate", json=line1)
+    assert r.status_code == 201
+    assert r.json()["batchref"] == batch1
+
+    # second order should go to batch 2
+    r = requests.post(f"{url}/allocate", json=line2)
+    assert r.status_code == 201
+    assert r.json()["batchref"] == batch2
+
+
+
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle flask_app.py
+from flask import Flask, request
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import config
+import model
+import orm
+import repository
+
+orm.start_mappers()
+get_session = sessionmaker(bind=create_engine(config.get_postgres_uri()))
+app = Flask(__name__)
+
+@app.route("/allocate", methods=["POST"])
+def allocate_endpoint():
+    session = get_session()
+    batches = repository.SqlAlchemyRepository(session).list()
+    line = model.OrderLine(
+        request.json["orderid"], request.json["sku"], request.json["qty"],
+    )
+    batchref = model.allocate(line, batches)
+
+    return {"batchref": batchref}, 201
+#+END_SRC
+
+* Error Conditions that Require Database Checks
