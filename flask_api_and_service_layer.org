@@ -55,6 +55,31 @@ def test_allocations_are_persisted(add_stock):
     assert r.status_code == 201
     assert r.json()["batchref"] == batch2
 
+# two more end to end tests
+@pytest.mark.usefixtures("restart_api")
+def test_400_message_for_out_of_stock(add_stock):
+    '''try to allocate more units than are in stock'''
+    sku, small_batch, large_order = random_sku(), random_batchref(), random_orderid()
+    add_stock(
+        [(small_batch, sku, 10, "2011-01-01")]
+    )
+    data = {"orderid": large_order, "sku": sku, "qty": 20}
+    url = config.get_api_url()
+    r = requests.post(f"{url}/allocate", json=data)
+    assert r.status_code == 400
+    assert r.json()["message"] == f"Out of stock for sku {sku}"
+
+@pytest.mark.usefixtures("restart_api")
+def test_400_message_for_invalid_sku():
+    '''try to get an order with an invalid sku'''
+    unknown_sku, orderid = random_sku(), random_orderid()
+    data = {"orderid": orderid, "sku": unknown_sku, "qty": 20}
+    url = config.get_api_url()
+    r = requests.post(f"{url}/allocate", json=data)
+    assert r.status_code == 400
+    assert r.json()["message"] == f"Invalid sku {unknown_sku}"
+
+
 
 
 #+END_SRC
@@ -81,9 +106,75 @@ def allocate_endpoint():
     line = model.OrderLine(
         request.json["orderid"], request.json["sku"], request.json["qty"],
     )
-    batchref = model.allocate(line, batches)
 
+    if not is_valid_sku(line.sku, batches):
+        return {"message": f"Invalid sku {line.sku}"}, 400
+
+    try:
+        batchref = model.allocate(line, batches)
+    except model.OutOfStock as e:
+        return {"message": str(e)}, 400
+
+    session.commit()
     return {"batchref": batchref}, 201
 #+END_SRC
 
-* Error Conditions that Require Database Checks
+* Introducing a Service Layer, and Using FakeRepository to Unit Test It
+
+If we look at what our flask app is doing, there's quite a lot of what we might call orchestration -- fetching stuff out of our repository, validating our input against database state, handling errors, and committing in the path. Most of these things have nothing to do with having an API endpoint, and they're not really things that need to be tested by end to end tests.
+
+It often makes sense to split out a service layer, sometimes called an orchestration layer or a use case layer.
+
+#+BEGIN_SRC python :tangle test_services.py
+def test_returns_allocation():
+    line = model.OrderLine("o1", "COMPLICATED-LAMP", 10)
+    batch = model.Batch("b1", "COMPLICATED-LAMP", 100, eta=None)
+    repo = FakeRepository([batch])  # hold the Batch objects used by our test
+
+    # call the service layer for an allocation
+    # this will sit between our allocate_endpoint() function in the api later
+    # and the allocate() domain service function from our domain model
+    result = services.allocate(line, repo, FakeSession())  # FakeSession is faking the database session
+    assert result == "b1"
+
+def test_error_for_invalid_sku():
+    line = model.OrderLine("o1", "NONEXISTENTSKU", 10)
+    batch = model.Batch("b1", "AREALSKU", 100, eta=None)
+    repo = FakeRepository([batch])
+
+    with pytest.raises(services.InvalidSku, match="Invalid sku NONEXISTENTSKU"):
+        services.allocate(line, repo, FakeSession())
+
+def test_commits():
+    line = model.OrderLine("o1", "OMINOUS-MIRROR", 10)
+    batch = model.Batch("b1", "OMINOUS-MIRROR", 100, eta=None)
+    repo = FakeRepository([batch])
+    session = FakeSession()
+
+    services.allocate(line, repo, session)
+    assert session.committed is True
+#+END_SRC
+
+* A Typical Service Function
+
+Typical service-layer functions have the following steps:
+1. We fetch some objects from the repository
+2. We make some checks or assertions about the request against the state of the world
+3. We call a domain service
+4. If all is well, we save/update any state we've changed
+
+#+BEGIN_SRC python :tangle services.py
+class InvalidSku(Exception):
+    pass
+
+def is_valid_sku(sku, batches):
+    return sku in {b.sku for b in batches}
+
+def allocate(line: OrderLine, repo: AbstractRepository, session) -> str:
+    batches = repo.list()
+    if not is_valid_sku(line.sku, batches):
+        raise InvalidSku(f"Invalid sku {line.sku}")
+    batchref = model.allocate(line, batches)
+    session.commit()
+    return batchref
+#+END_SRC
