@@ -178,3 +178,85 @@ def allocate(line: OrderLine, repo: AbstractRepository, session) -> str:
     session.commit()
     return batchref
 #+END_SRC
+
+Now, with a service layer, our Flask app looks a lot cleaner:
+
+#+BEGIN_SRC python
+@app.route("/allocate", methods=["POST"])
+def allocate_endpoint():
+    session = get_session()
+    repo = repository.SqlAlchemyRepository(session)
+    line = model.OrderLine(
+        request.json["orderid"], request.json["sku"], request.json["qty"]
+    )
+
+    try:
+        batchref = services.allocate(line, repo, session)
+    except (model.OutOfStock, services.InvalidSku) as e:
+        return {"message": str(e)}, 400
+
+    return {"batchref": batchref}, 201
+#+END_SRC
+
+Then we can strip down our end to end tests to just two, one for the happy path and one for the unhappy path:
+
+#+BEGIN_SRC python
+# happy path E2E test
+@pytest.mark.usefixtures("restart_api")
+def test_happy_path_returns_201_and_allocated_batch(add_stock):
+    sku, othersku = random_sku(), random_sku("other")
+    earlybatch, laterbatch, otherbatch = random_batchref(1), random_batchref(2), random_batchref(3)
+    add_stock([(laterbatch, sku, 100, "2011-01-02"),
+               (earlybatch, sku, 100, "2011-01-01"),
+               (otherbatch, othersku, 100, None)])
+    data = {"orderid": random_orderid(), "sku": sku, "qty": 3}
+    url = config.get_api_url()
+
+    r = requests.post(f"{url}/allocate", json=data)
+
+    assert r.status_code == 201
+    assert r.json()["batchref"] == earlybatch
+
+@pytest.mark.usefixtures("restart_api")
+def test_unhappy_path_returns_400_and_error_message():
+    unknown_sku, orderid = random_sku(), random_orderid()
+    data = {"orderid": orderid, "sku": unknown_sku, "qty": 20}
+    url = config.get_api_url()
+    r = requests.post(f"{url}/allocate", json=data)
+    assert r.status_code == 400
+    assert r.json()["message"] == f"Invalid sku {unknown_sku}"
+
+
+#+END_SRC
+
+Here is a file directory to show roughly where things would belong:
+
+#+BEGIN_SRC txt
+.
+├── config.py
+├── domain  #(1)
+│   ├── __init__.py
+│   └── model.py
+├── service_layer  #(2)
+│   ├── __init__.py
+│   └── services.py
+├── adapters  #(3)
+│   ├── __init__.py
+│   ├── orm.py
+│   └── repository.py
+├── entrypoints  (4)
+│   ├── __init__.py
+│   └── flask_app.py
+└── tests
+    ├── __init__.py
+    ├── conftest.py
+    ├── unit
+    │   ├── test_allocate.py
+    │   ├── test_batches.py
+    │   └── test_services.py
+    ├── integration
+    │   ├── test_orm.py
+    │   └── test_repository.py
+    └── e2e
+        └── test_api.py
+#+END_SRC
