@@ -1,1 +1,176 @@
 #+TITLE: Test Driven Development in High Gear and Low Gear
+
+The service layer helps us clearly define our use cases and the workflow for each: what we need to get from our repositories, what pre-checks and current state validation we should do, and what we save at the end.
+
+Currently many of our unit tests operate at a lower level, acting directly on the model. In this chapter we discuss the trade-offs involved in moving those tests up to the service-layer level, and some more general testing guidelines.
+
+* Should Domain Layer Tests Move to the Service Layer?
+
+We use tests to enforce that a property of the system doesn't change while we're working. If we accidentally change a behavior, our tests break. The flip side is that if we want to change the design of our code, any tests directly relying on that code will also fail.
+
+As we get further in the book, we'll see how the service layer forms an API for our system that we can drive in multiple ways. Testing against
+this API reduces the amount of code that we need to change when we refactor our domain model. If we restrict ourselves to testing only against
+a service layer, we won't have any tests that directly interact with "private" methods or attributes on our model objects, which leaves us freer
+to refactor them.
+
+| Every line of code that we put in a test is like a blob of glue, holding the system in a particular shape.
+| The more low-level tests we have, the harder it will be to change things
+
+* Fully Decoupling the Service-Layer Tests from the Domain
+
+To have a service layer that's fully decoupled from the domain, we need to rewrite its API to work in terms of primitives.
+
+Before:
+
+allocate takes a domain object
+
+#+BEGIN_SRC python
+def allocate(line: OrderLine, repo: AbstractRepository, session) -> str:
+#+END_SRC
+
+After:
+
+Allocate takes primitive types (strings and ints)
+
+#+BEGIN_SRC python
+def allocate(orderid: str, sku: str, qty: int, repo: AbstractRepository, session) -> str:
+#+END_SRC
+
+and our test would become:
+
+#+BEGIN_SRC python
+def test_returns_allocation():
+    batch = model.Batch("batch1", "COMPLICATED-LAMP", 100, eta=None)
+    repo = FakeRepository([batch1])
+    result = services.allocate("o1", "COMPLICATED-LAMP", 10, repo, FakeSession())
+    assert result == "batch1"
+#+END_SRC
+
+Our tests still depend on the domain though, because we still manually instantiate Batch objects. So, if one day we decide to massively
+refactor how our Batch model works, we'll have to change a bunch of tests.
+
+* Mitigation: Keep All Domain Dependencies in Fixture Functions
+
+We could abstract that out to a helper function or a fixture in our tests. Here is one way we could do that:
+
+#+BEGIN_SRC python
+class FakeRepository(set):
+    @staticmethod
+    def for_batch(ref, sku, qty, eta=None):
+        return FakeRepository([
+            model.Batch(ref, sku, qty, eta)
+        ])
+    # ...
+
+def test_returns_allocation():
+    repo = FakeRepository.for_batch("batch1", "COMPLICATED-LAMP", 100, eta=None)
+    result = services.allocate("o1", "COMPLICATED-LAMP", 10, repo, FakeSession())
+    assert result == "batch1"
+#+END_SRC
+
+This would move all of our tests' dependencies on the domain into one place.
+
+* Add a Missing Service
+
+We could go a step further. If we had a service to add stock, we could use that and make our service-layer tests fully expressed in terms of the service layer's officialy use cases, removing all dependencies on the domain:
+
+#+BEGIN_SRC python
+def test_add_batch():
+    repo, session = FakeRepository([]), FakeSession()
+    services.add_batch("b1", "CRUNCHY-ARMCHAIR", 100, None, repo, session)
+    assert repo.get("b1") is not None
+    assert session.committed
+
+def add_batch(ref: str, sku: str, qty: int, eta: Optional[date],
+              repo: AbstractRepository, session) -> None:
+    repo.add(model.Batch(ref, sku, qty, eta))
+    session.commit()
+
+def allocate(orderid: str, sku: str, qty: int, repo: AbstractRepository, session) -> str:
+    # ...
+    pass
+#+END_SRC
+
+This now allows us to rewrite all of our service-layer tests purely in terms of the services themselves, using only primitives and without any dependencies on the model.
+
+#+BEGIN_SRC python
+def test_allocate_returns_allocation():
+    repo, session = FakeRepository([]), FakeSession()
+    services.add_batch("batch1", "COMPLICATED-LAMP", 100, None, repo, session)
+    result = services.allocate("o1", "COMPLICATED-LAMP", 10, repo, session)
+    assert result == "batch1"
+
+def test_allocate_errors_for_invalid_sku():
+    repo, session = FakeRepository([]), FakeSession()
+    services.add_batch("b1", "AREALSKU", 100, None, repo, session)
+    with pytest.raises(services.InvalidSku, match="Invalid sku NONEXISTENTSKU"):
+        services.allocate("o1", "NONEXISTENTSKU", 10, repo, FakeSession())
+#+END_SRC
+
+Our service layer tests depend on only the service layer itself, leaving us completely free to refactor the model as we see fit.
+
+* Carrying the Improvement Through to E2E Tests
+
+In the same way that adding add_batch helped decouple our service layer tests from the model, adding an API endpoint to add a batch
+would remove the need for the ugly add_stock fixture, and our end to end tests could be free of those hardcoded SQL queries and the direct dependency on the database.
+
+#+BEGIN_SRC python
+@app.route("/add_batch", methods=["POST"])
+def add_batch():
+    session = get_session()
+    repo = repository.SqlAlchemyRepository(session)
+    eta = request.json["eta"]
+    if eta is not None:
+        eta = datetime.fromisoformat(eta).date()
+    services.add_batch(
+        request.json["ref"],
+        request.json["sku"],
+        request.json["qty"],
+        eta,
+        repo,
+        session
+    )
+    return "OK", 201
+#+END_SRC
+
+Now API tests can add their own batches
+
+#+BEGIN_SRC python
+def post_to_add_batch(ref, sku, qty, eta):
+    url = config.get_api_url()
+    r = requests.post(
+        f"{url}/add_batch", json={"ref": ref, "sku": sku, "qty": qty, "eta": eta}
+    )
+    assert r.status_code == 201
+
+
+@pytest.mark.usefixtures("postgresdb")
+@pytest.mark.usefixtures("restart_api")
+def test_happy_path_returns_201_and_allocated_batch():
+    sku, othersku = random_sku(), random_sku("other")
+    earlybatch, laterbatch, otherbatch = random_batchref(1), random_batchref(2), random_batchref(3)
+    post_to_add_batch(laterbatch, sku, 100, "2011-01-02")
+    post_to_add_batch(earlybatch, sku, 100, "2011-01-01")
+    post_to_add_batch(otherbatch, othersku, 100, None)
+    data = {"orderid": random_orderid(), "sku": sku, "qty": 3}
+
+    url = config.get_api_url()
+    r = requests.post(f"{url}/allocate", json=data)
+
+    assert r.status_code == 201
+    assert r.json()["batchref"] == earlybatch
+#+END_SRC
+
+* Recap: Rules of Thumb for Different Types of Test
+
+** Aim for one end to end test per feature
+The objective is to demonstrate that the feature works, and that all the moving parts are glued together correctly
+
+** Write the bulk of your tests against the service layer
+Each test tends to cover one code path of a feature and use fakes for I/O.
+This is the place to exhaustively cover all the edge cases and the ins and outs of your business logic.
+** Maintain a small core of tests written against your domain model
+These tests have highly focused coverage and are more brittle, but they have the highest feedback.
+** Error handling counts as a feature
+Ideally, our application will be structured such that all errors that bubble up to our entrypoints (e.g., Flask) are handled in the same way.
+This means we need to test only the hapy path for each feature, and to reserve one end to end test for all unhappy paths (and many unhappy path unit tests, or course)
