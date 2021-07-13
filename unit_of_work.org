@@ -1,0 +1,111 @@
+#+TITLE: Unit of Work Pattern
+
+If the repository pattern is our abstraction over the idea of persistent storage, the Unit of Work (UoW) pattern is our abstraction over the idea of atomic operations. It will allow us to fully decouple our service layer from the data layer.
+
+* The Unit of Work Collaborates with the Repository
+
+#+BEGIN_SRC python
+def allocate(orderid: str,
+             sku: str,
+             qty: int,
+             uow: unit_of_work.AbstractUnitOfWork) -> str:
+    line = OrderLine(orderid, sku, qty)
+    with uow:  # 1
+        batches = uow.batches.list()  # 2
+        # ...
+        batchref = model.allocate(line, batches)
+        uow.commit()  # 3
+#+END_SRC
+
+1. We start UoW as a context manager
+2. uow.batches is the batches repo, so the UoW provides us with access to our permanent storage
+3. When we're done, we commit or roll back our work, using the UoW
+
+The UoW acts as a single entrypoint to our persistent storage, and it keeps track of what objects were loaded and of the latest state.
+
+This gives us 3 useful things:
+  - A stable snapshot of the database to work with, so the objects we use aren't changing halfway through an operation
+  - A way to persist all of our changes at once, so if something goes wrong, we don't end up in an inconsistent state
+  - A simple API to our persistence concerns and a handy place to get a repository
+
+* Test-Driving a UoW with Integration Tests
+
+Here are our integration tests for the unit of work:
+
+#+BEGIN_SRC python
+def test_uow_can_retrieve_a_batch_and_allocate_to_it(session_factory):
+    session = session_factory()
+    insert_batch(session, "batch1", "HIPSTER-WORKBENCH", 100, None)
+    session.commit()
+
+    uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)  # 1
+    with uow:
+        batch = uow.batches.get(reference="batch1")  # 2
+        line = model.OrderLine("o1", "HIPSTER-WORKBENCH", 10)
+        batch.allocate(line)
+        uow.commit()  # 3
+
+    batchref = get_allocated_batch_ref(session, "o1", "HIPSTER-WORKBENCH")
+    assert batchref == "batch1"
+#+END_SRC
+
+1. We initialize the UoW by using our custom session factory and get back a uow object to use in our with block
+2. The UoW gives us access to the batches repository via uow.batches
+3. We call commit() on it when we're done
+
+* Unit of Work and its Context Manager
+
+#+BEGIN_SRC python :tangle unit_of_work.py
+import abc
+
+class AbstractUnitOfWork(abc.ABC):
+    batches: repository.AbstractRepository  # 1
+
+    def __exit__(self, *args):  # 2
+        self.rollback()  # 4
+
+    @abc.abstractmethod
+    def commit(self):  # 3
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def rollback(self):  # 4
+        raise NotImplementedError
+#+END_SRC
+
+
+1. The UoW provides an attribute called .batches which will give us access to the batches repository
+2. __enter__ and __exit__ are the two magic methods that execute when we enter the with block and when we exit it. They're our setup and teardown phases
+3. We'll call this method to explicitly commit our work when ready
+4. If we don't commit, or if we exit the context manager by raising an error, we do a rollback. The rollback has to effect if commit() has been called
+
+* The Real Unit of Work Uses SQLAlchemy Sessions
+
+The main thing that our concrete implementation adds is the database session
+
+#+BEGIN_SRC python :tangle unit_of_work.py
+DEFAULT_SESSION_FACTORY = sessionmaker(
+    bind=create_engine(
+        config.get_postgres_uri(),
+    )
+)
+
+class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
+    def __init__(self, session_factory=DEFAULT_SESSION_FACTORY):
+        self.session_factory = session_factory
+
+    def __enter__(self):
+        self.session = self.session_factory()
+        self.batches = repository.SqlAlchemyRepository(self.session)
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        super().__exit__(*args)
+        self.session.close()
+
+    def commit(self):
+        self.session.commit()
+
+    def rollback(self):
+        self.session.rollback()
+#+END_SRC
