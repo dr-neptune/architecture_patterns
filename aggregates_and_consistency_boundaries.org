@@ -1,1 +1,142 @@
 #+TITLE: Aggregates and Consistency Boundaries
+
+In this chapter, we will revisit our domain model to talk about invariants and constraints, and see how our domain objects can maintain their own internal consistency, both conceptually and in persistent storage.
+
+We'll introduce a new object called Product to wrap multiple batches, and we'll make the old allocate() domain service available as a method on Product instead.
+
+
+#+DOWNLOADED: /tmp/screenshot.png @ 2021-07-14 07:46:50
+[[file:screenshot_2021-07-14_07-46-50.png]]
+
+
+* Invariants, Constraints and Consistency
+
+Much of the domain logic we write exists to enforce constraints in order to maintain the invariants of the system. The *invariants* are the things that have to be true whenever we finish an operation.
+
+A constraint is a rule that restricts the possible states our model can get into, while an invariant is defined as a condition that is always true.
+
+Each time we update the state of the system, our code needs to ensure that we don't break the invariant. This is relatively easy in a single-threaded
+system, but gets much harder when we introduce concurrency.
+
+* What Is an Aggregate?
+
+An aggregate is just a domain object that contains other domain objects and lets us treat the whole collection as a single unit.
+In other words, an aggregate is a cluster of associated objects that we treat as a unit for the purpose of data changes.
+The only way to modify the objects inside the aggregate is to load the whole thing, and to call methods on the aggregate itself.
+
+* Choosing an Aggregate
+
+The aggregate will be the boundary where we make sure every option ends in a consistent state.
+
+The plan is this:
+When we want to allocate an order line, instead of allocating against all batches using the domain service, there will be a new Product object for the particular SKU of the order line, and it will be in charge of all the batches for that sku, and we can call a .allocate() method on that instead.
+
+#+BEGIN_SRC python
+class Product:
+    def __init__(self, sku: str, batches: List[Batch]):
+        self.sku = sku  # 1
+        self.batches = batches  # 2
+
+    def allocate(self, line: OrderLine) -> str:  # 3
+        try:
+            batch = next(b for b in sorted(self.batches) if b.can_allocate(line))
+            batch.allocate(line)
+            return batch.reference
+        except StopIteration:
+            raise OutOfStock(f"Out of stock for sku {line.sku}")
+#+END_SRC
+
+1. Product's main identifier is the sku
+2. Our Product class holds a reference to a collection of batches for that SKU
+3. We can move the allocate() domain service to be a method on the Product aggregate
+
+* One Aggregate = One Repository
+
+Once we define certain entities to be aggregates, we need to apply the rule that they are the only entities that are publicly accessible to the outside world. In other words, the only repositories that are allowed should be repositories that return aggregates.
+
+In our case, we'll switch from BatchRepository to ProductRepository
+
+#+BEGIN_SRC python
+# in unit_of_work.py
+class AbstractUnitOfWork(abc.ABC):
+    products: repository.AbstractProductRepository
+    # ...
+
+# in repository.py
+class AbstractProductRepository(abc.ABC):
+    @abc.abstractmethod
+    def add(self, product):
+        # ...
+        pass
+
+    @abc.abstractmethod
+    def get(self, sku) -> model.Product:
+        # ...
+        pass
+#+END_SRC
+
+The ORM layer will need some tweaks so that the right batches automatically get loaded and associated with Product objects. The Repository pattern means we don't have to worry about that yet. We can just use our FakeRepository and then feed through the new model into our service layer to see how it looks with Product as its main entrypoint:
+
+#+BEGIN_SRC python
+def add_batch(ref: sku, sku: str, qty: int, eta: Optional[date], uow: unit_of_work.AbstractUnitOfWork):
+    with uow:
+        product = uow.products.get(sku=sku)
+        if product is None:
+            product = model.Product(sku, batches=[])
+            uow.products.add(product)
+        product.batches.append(model.Batch(ref, sku, qty, eta))
+        uow.commit()
+
+def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:
+    line = OrderLine(orderid, sku, qty)
+    with uow:
+        product = uow.products.get(sku=line.sku)
+        if product is None:
+            raise InvalidSku(f"Invalid sku {line.sku}")
+        batchref = product.allocate(line)
+        uow.commit()
+    return batchref
+#+END_SRC
+
+* Optimistic Concurrency with Version Numbers
+
+We've solved the conceptual problem of choosing an object to be in charge of consistency boundaries. Let's now spend a little time talking about how to enforce data integrity at the database level.
+
+We don't want to hold a lock over the entire batches table, but how will we implement holding a lock over just the rows for a particular SKU?
+
+One answer is to have a single attribute on our Product model that acts as a marker for the whole state change being complete and to use it as
+the single resource that concurrent workers can fight over. If two transactions read the state of the world for batches at the same time, and both want to update the allocations tables, we force both to also try to update the version_number in the products table, in such a way that only one of them can win and the world stays consistent.
+
+* Implementation Options for Version Numbers
+
+We will place it in the domain
+
+#+BEGIN_SRC python
+class Product:
+    def __init__(self, sku: str, batches: List[Batch], version_number: int = 0):
+        self.sku = sku
+        self.batches = batches
+        self.version_number = version_number
+
+    def allocate(self, line: OrderLine) -> str:
+        try:
+            batch = next(b for b in sorted(self.batches) if b.can_allocate(line))
+            batch.allocate(line)
+            self.version_number += 1
+            return batch.reference
+        except StopIteration:
+            raise OutOfStock(f"Out of stock for sku {line.sku}")
+#+END_SRC
+
+* Testing for Our Data Integrity Rules
+
+If we have two concurrent attempts to do allocation against the same Product, one of them should fail, because they can't both update the version number.
+
+#+BEGIN_SRC python
+# simulate a slow transaction using a function that does allocation and then does an explicit sleep
+def try_to_allocate(orderid, sku, exceptions):
+    pass
+
+
+# slow allocation twice, using threads
+#+END_SRC
