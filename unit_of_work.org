@@ -109,3 +109,134 @@ class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
     def rollback(self):
         self.session.rollback()
 #+END_SRC
+
+* Fake Unit of Work Testing
+
+#+BEGIN_SRC python
+class FakeUnitOfWork(unit_of_work.AbstractUnitOfWork):
+    def __init__(self):
+        self.batches = FakeRepository([])
+        self.committed = False
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        pass
+
+def test_add_batch():
+    uow = FakeUnitOfWork()
+    services.add_batch("b1", "CRUNCHY-ARMCHAIR", 100, None, uow)
+    assert uow.batches.get("b1") is not None
+    assert uow.committed
+
+def test_allocate_returns_allocation():
+    uow = FakeUnitOfWork()
+    services.add_batch("batch1", "COMPLICATED-LAMP", 100, None, uow)
+    result = services.allocate("o1", "COMPLICATED-LAMP", 10, uow)
+    assert result == "batch1"
+#+END_SRC
+
+* Using the UoW in the Service Layer
+
+#+BEGIN_SRC python
+def add_batch(ref: str, sku: str, qty: int, eta: Optional[date], uow: unit_of_work.AbstractUnitOfWork):
+    with uow:
+        uow.batches.add(model.Batch(ref, sku, qty, eta))
+        uow.commit()
+
+def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:  # 1
+    line = OrderLine(orderid, sku, qty)
+    with uow:
+        batches = uow.batches.list()
+        if not is_valid_sku(line.sku, batches):
+            raise InvalidSku(f"Invalid sku {line.sku}")
+        batchref = model.allocate(line, batches)
+        uow.commit()
+    return batchref
+#+END_SRC
+
+1. Our service layer now has only the one dependency, on an abstract Unit of Work
+
+* Explicit Tests for Commit/Rollback Behavior
+
+Integration tests for rollback behavior
+
+#+BEGIN_SRC python
+def test_rolls_back_uncommited_work_by_default(session_factory):
+    uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
+    with uow:
+        insert_batch(uow.session, "batch1", "MEDIUM-PLINTH", 100, None)
+
+    new_session = session_factory()
+    rows = list(new_session.execute('SELECT * FROM "batches"'))
+    assert rows == []
+
+def test_rolls_back_on_error(session_factory):
+    class MyException(Exception):
+        pass
+
+    uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
+    with pytest.raises(MyException):
+        with uow:
+            insert_batch(uow.session, "batch1", "LARGE-FORK", 100, None)
+            raise MyException()
+
+    new_session = session_factory()
+    rows = list(new_session.execute('SELECT * FROM "batches"'))
+    assert rows == []
+#+END_SRC
+
+* Explicit vs. Implicit Commits
+
+We have chosen here to make commits explicit, but could have easily designed the UoW pattern to commit by default and only rollback on an error. It may be better to choose to make the commit explicit here, as it makes the system safe by default.
+
+* Examples: Using UoW to Group Multiple Operations into an Atomic Unit
+
+** Example 1: Reallocate
+
+Suppose we want to be able to deallocate and then reallocate orders
+
+#+BEGIN_SRC python
+def reallocate(line: OrderLine, uow: AbstractUnitOfWork) -> str:
+    with uow:
+        batch = uow.batches.get(sku=line.sku)
+        if batch if None:
+            raise InvalidSku(f'Invalid sku {line.sku}')
+        batch.deallocate(line)  # 1
+        allocate(line)  # 2
+        uow.commit()
+#+END_SRC
+
+1. If deallocate fails, we don't want to call allocate
+2. If allocate fails, we probably don't want to commit the deallocate either
+
+** Example 2: Change Batch Quantity
+
+The shipping company calls to say that one of the container doors opened and half the sofas have fallen into the Indian Ocean.
+
+#+BEGIN_SRC python
+def change_batch_quantity(batchref: str, new_qty: int, uow: AbstractUnitOfWork):
+    with uow:
+        batch = uow.batches.get(reference=batchref)
+        batch.change_purchased_quantity(new_qty)
+        with batch.available_quantity < 0:
+            line = batch.deallocate_one()  # 1
+        uow.commit()
+#+END_SRC
+
+1. Here we may need to deallocate any number of lines. If we get a failure at any stage, we probably want to commit none of the changes.
+
+* Unit of Work Pattern Recap
+
+** The Unit of Work pattern is an abstraction around data integrity
+It helps to enforce the consistency of our domain model, and improves performance, by letting us perform a single flush operation at the end of an operation
+
+** It works closely with the Repository and Service Layer patterns
+The Unit of Work pattern completes our abstractions over data access by representing atomic updates. Each of our service-layer use cases runs in a single unit of work that succeeds or fails as a block
+
+** This is a lovely case for a context manager
+Context managers are an idiomatic way of defining scope in Python. We can use a context manager to automatically roll back our work at the end of a request, which means the system is safe by default
+
+** SQLAlchemy already implements this pattern
+We introduce an even simpler abstraction over the SQLAlchemy Session object in order to "narrow" the interface between the ORM and our code. This helps to keep us loosely coupled.
