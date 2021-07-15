@@ -79,3 +79,73 @@ class Product:
 3. We're also going to stop raising an exception for the out-of-stock case. The event will do the job the exception was doing.
 
 * The Message Bus Maps Events to Handlers
+
+A message bus basically says, "When I see this event, I should invoke the following handler function."
+
+In other words, it's a simple publish-subscribe system. Handlers are subscribed to receive events, which we publish to the bus.
+It sounds harder than it is, and we usually implement it with a dict
+
+#+BEGIN_SRC python
+def handle(event: events.Event):
+    for handler in HANDLERS[type(event)]:
+        handler(event)
+
+def send_out_of_stock_notification(event: events.OutOfStock):
+    email.send_email(
+        "stock@lol.example",
+        f"Out of stock for {event.sku}"
+    )
+
+HANDLERS = {
+    events.OutOfStock: [send_out_of_stock_notification]
+}  # type: Dict[Type[events.Event], List[Callable]]
+#+END_SRC
+
+* Option 1: The Service Layer Takes Events from the Model and Puts Them on the Message Bus
+
+Our domain model raises events, and our message bus will call the right handlers whenever an event happens. Now all we need is to connect the two. We need something to catch events from the model and pass them to the message bus -- the publishing step.
+
+The simplest way to do this is by adding some code into our service layer.
+
+#+BEGIN_SRC python
+from . import messagebus
+
+def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:
+    line = OrderLine(orderid, sku, qty)
+    with uow:
+        product = uow.products.get(sku=line.sku)
+        if product is None:
+            raise InvalidSku(f"Invalid sku {line.sku}")
+        try:
+            batchref = product.allocate(line)
+            uow.commit()
+            return batchref
+        finally:  # 1
+            messagebus.handle(product.events)  # 2
+#+END_SRC
+
+1. We keep the try/finally from our earlier implementation
+2. Instead of depending directly on an email infrastructure, the service layer is just in charge of passing events from the model up to the message bus.
+
+* Option 2: The Service Layer Raises Its Own Events
+
+We could have the service layer in charge of creating and raising events directly, rather than having them raised by the domain model.
+
+#+BEGIN_SRC python
+def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:
+    line = OrderLine(orderid, sku, qty)
+    with uow:
+        product = uow.products.get(sku=line.sku)
+        if product is None:
+            raise InvalidSku(f"Invalid sku {line.sku}")
+        batchref = product.allocate(line)
+        uow.commit()  # 1
+
+        if batchref is None:
+            messagebus.handle(events.OutOfStock(line.sku))
+        return batchref
+#+END_SRC
+
+1. We commit even if we fail to allocate because the code is simpler this way and it's easier to reason about. We always commit unless something goes wrong. Committing when we haven't changed anything is safe and keeps the code uncluttered.
+
+* Option 3: The UoW Publishes Events to the Message Bus
