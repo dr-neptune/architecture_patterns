@@ -1,0 +1,281 @@
+#+TITLE: Going to Town on the Message Bus
+
+In this chapter we will make events more fundamental to the internal structure of our application.
+Instead of events being an optional side effect, the message bus will be the main entrypoint to the service layer
+where everything goes via the message bus and our app is transformed into a message processor.
+
+* Imagining an Architecture Change: Everything will be an Event Handler
+
+Currently we have two kinds of flows through our system:
+
+- API calls that are handled by a service-layer function
+- Internal events (which might be raised as a side effect of a service layer function) and their handlers (which in turn call service-layer functions)
+
+If we rethink our API calls as capturing events, the service layer functions can be event handlers too, and everything would be an event handler.
+
+We will follow the Preparatory Refactoring workflow: "Make the change easy; then make the easy change":
+
+1. Refactor the service layer into event handlers. We can get used to the idea of events being the way we describe inputs to the system.
+2. We build an end-to-end test that puts BatchQuantityChanged events into the system and looks for Allocated events coming out
+3. We will have a new handler for BatchQuantityChanged events, whose implementation will emit AllocationRequired events, which in turn
+will be handled by the exact same handler for allocations that the API uses.
+
+* Refactoring Service Functions to Message Handlers
+
+We start by defining the two events that capture our current API inputs
+
+#+BEGIN_SRC python
+from dataclasses import dataclass
+
+@dataclass
+class BatchCreated(Event):
+    ref: str
+    sku: str
+    qty: int
+    eta: Optional[date] = None
+
+@dataclass
+class BatchQuantityChanged(Event):
+    ref: str
+    qty: int
+
+@dataclass
+class AllocationRequired(Event):
+    orderid: str
+    sku: str
+    qty: int
+#+END_SRC
+
+Then we rename services.py to handlers.py.
+
+#+BEGIN_SRC python :tangle handlers.py
+def add_batch(
+        event: events.BatchCreated,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    with uow:
+        product = uow.products.get(sku=event.sku)
+        # ...
+
+def allocate(
+        event: events.AllocationRequired,
+        uow: unit_of_work.AbstractUnitOfWork
+) -> str:
+    line = OrderLine(event.orderid, event.sku, event.qty)
+    # ...
+
+def send_out_of_stock_notification(
+        event: events.OutOfStock,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    email.send("stock@made.com",
+               f"Out of stock for {event.sku}")
+#+END_SRC
+
+* The Message Bus Now Collects Events from the UoW
+
+Our event handlers now need a Unit of Work. As our message bus becomes more central to our application, it makes sense to put it explicitly in charge of collecting and processing new events. Instead of having the UoW push events onto the message bus, we will have the message bus pull events from the UoW.
+
+#+BEGIN_SRC python :tangle messagebus.py
+def handle(
+        event: events.Event,
+        uow: unit_of_work.AbstractUnitOfWork  # 1
+):
+    """Takes a UoW and manages a queue"""
+    queue = [event]  # 2
+    while queue:
+        event = queue.pop(0)  # 3
+        for handler in HANDLERS[type(event)]:  # 3
+            handler(event, uow=uow)  # 4
+            queue.extend(uow.collect_new_events())  # 5
+#+END_SRC
+
+1. The message bus now gets passed the UoW each time it starts up.
+2. When we begin handling our first event, we start a queue
+3. We pop events from the front of the queue and invoke their handlers (the HANDLERS dict hasn't changed; it still maps event types to handler functions)
+4. The message bus passed the UoW down to each handler
+5. After each handler finishes, we collect any new events that have been generated and add them to the queue
+
+* A Temporary Ugly Hack: The Message Bus has to Return Results
+
+Our API and our service layer currently want to know the allocated batch reference when they invoke our allocate() handler.
+This means we need to put in a temporary hack on our message bus to let it return events:
+
+#+BEGIN_SRC python
+def handle(
+        event: events.Event,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    """Takes a UoW and manages a queue"""
+    results = []
+    queue = [event]  # 2
+    while queue:
+        event = queue.pop(0)  # 3
+        for handler in HANDLERS[type(event)]:
+            results.append(handler(event, uow_uow))
+            queue.extend(uow.collect_new_events())
+    return results
+#+END_SRC
+
+This is because we are mixing the read and write responsibilities in our system.
+
+* Modifying Our API to Work with Events
+
+#+BEGIN_SRC python :tangle flask_app.py
+@app.route("/allocate", methods=["POST"])
+def allocate_endpoint():
+    try:
+        event = events.AllocationRequired(
+            request.json["orderid"], request.json["sku"], request.json["qty"]
+        )
+        results = messagebus.handle(event, unit_of_work.SqlAlchemyUnitOfWork())
+        batchref = results.pop(0)
+    except InvalidSku as e
+#+END_SRC
+
+Instead of calling the service layer with a bunch of primitives extracted from the request json, we instantiate an event and pass it to the message bus.
+
+* Test-Driving a New Handler
+
+#+BEGIN_SRC python
+class TestChangeBatchQuantity:
+    def test_changes_available_quantity(self):
+        uow = FakeUnitOfWork()
+        messagebus.handle(
+            events.BatchCreated("batch1", "ADORABLE-SETTEE", 100, None), uow
+        )
+        [batch] = uow.products.get(sku="ADORABLE-SETTEE").batches
+        assert batch.available_quantity == 100
+
+        messagebus.handle(events.BatchQuantityChanged("batch1", 50), uow)
+
+        assert batch.availabe_quantity == 50
+
+def test_reallocates_if_necessary(self):
+    uow = FakeUnitOfWork()
+    event_history = [
+        events.BatchCreated("batch1", "INDIFFERENT-TABLE", 50, None),
+        events.BatchCreated("batch2", "INDIFFERENT-TABLE", 50, date.today()),
+        events.AllocationRequired("order1", "INDIFFERENT-TABLE", 20),
+        events.AllocationRequired("order2", "INDIFFERENT-TABLE", 20)
+    ]
+
+    for e in event_history:
+        messagebus.handle(e, uow)
+
+    [batch1, batch2] = uow.products.get(sku="INDIFFERENT-TABLE").batches
+    assert batch1.available_quantity == 10
+    assert batch2.available_quantity == 50
+
+    messagebus.handle(events.BatchQuantityChanges("batch1", 25), uow)
+
+    # order1 or order2 will be deallocated, so we'll have 25 - 20
+    assert batch1.available_quantity == 5
+    # and 20 will be reallocated to the next batch
+    assert batch2.available_quantity == 30
+#+END_SRC
+
+* Implementation
+
+Our new handler is simple:
+
+#+BEGIN_SRC python :tangle handlers.py
+def change_batch_quantity(
+        event: events.BatchQuantityChanged,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    with uow:
+        product = uow.products.get_by_batchref(batchref=event.ref)
+        product.change_batch_quantity(ref=event.ref, qty=event.qty)
+        uow.commit()
+#+END_SRC
+
+* A New Method on the Domain Model
+
+We add the new method to the model, which does the quantity change and deallocation(s) inline and publishes a new event. We also modify the existing allocate function to publish an event:
+
+#+BEGIN_SRC python :tangle model.py
+class Product:
+    # ...
+    def change_batch_quantity(self, ref: str, qty: int):
+        batch = next(b for b in self.batches if b.reference == ref)
+        batch._purchased_quantity = qty
+        while batch.available_quantity < 0:
+            line = batch.deallocate_one()
+            self.events.append(
+                events.AllocationRequired(line.orderid, line.sku, line.qty)
+            )
+
+class Batch:
+    # ...
+    def deallocate_one(self) -> OrderLine:
+        return self._allocations.pop()
+#+END_SRC
+
+We wire up our new handler:
+
+#+BEGIN_SRC python :tangle messagebus.py
+HANDLERS = {
+    events.BatchCreated: [handlers.add_batch],
+    events.BatchQuantityChanged: [handlers.change_batch_quantity],
+    events.AllocationRequired: [handlers.allocate],
+    events.OutOfStock: [handlers.send_out_of_stock_notification]
+}  # type: Dict[Type[events.Event], List[Callable]]
+#+END_SRC
+
+and our new requirement is fully implemented
+
+* Optionally: Unit Testing Event Handlers in Isolation with a Fake Message Bus
+
+We can make a "fake" message bus to test some handlers in isolation from one another.
+
+We intervene by modifying the publish_events() method on FakeUnitOfWork and decouple it from a real message bus
+
+#+BEGIN_SRC python :tangle teset_handlers.py
+class FakeUnitOfWorkWithFakeMessageBus(FakeUnitOfWork):
+    def __init__(self):
+        super().__init__()
+        self.events_published = []  # type: List[events.Event]
+
+    def publish_events(self):
+        for product in self.products.seen:
+            while product.events:
+                self.events_published.append(product.events.pop(0))
+#+END_SRC
+
+Instead of checking all the side effects, we just check that BatchQuantityChanged leads to AllocationRequired if the quantity drops below the total already allocated:
+
+#+BEGIN_SRC python :tangle test_handlers.py
+def teste_reallocates_if_necessary_isolated():
+    uow = FakeUnitOfWorkWithFakeMessageBus()
+
+    # test setup as before
+    event_history = [
+        events.BatchCreated("batch1", "INDIFFERENT-TABLE", 50, None),
+        events.BatchCreated("batch2", "INDIFFERENT-TABLE", 50, date.today()),
+        events.AllocationRequired("order1", "INDIFFERENT-TABLE", 20),
+        events.AllocationRequired("order2", "INDIFFERENT-TABLE", 20)
+    ]
+
+    for e in event_history:
+        messagebus.handle(e, uow)
+
+    [batch1, batch2] = uow.products.get(sku="INDIFFERENT-TABLE").batches
+    assert batch1.available_quantity == 10
+    assert batch2.available_quantity == 50
+
+    messagebus.handle(events.BatchQuantityChanged("batch1", 25), uow)
+
+    # assert on new events emitted rather than downstream side effects
+    [reallocation_event] = uow.events_published()
+    assert isinstance(reallocation_event, events.AllocationRequired)
+    assert reallocation_event.orderid in {"order1", "order2"}
+    assert reallocation_event.sku == "INDIFFERENT-TABLE"
+#+END_SRC
+
+* What Have We Achieved?
+
+Events are simple dataclasses that define the data structures for inputs and internal messages within our system.
+Handlers are the way we react to events. They can call down to our model or call out to external services. We can
+define multiple handlers for a single event if we want to. Handlers can also raise other events. This allows us to
+be very granular about what a handler does and really stick to the SRP (Separation of Responsibility Principle).

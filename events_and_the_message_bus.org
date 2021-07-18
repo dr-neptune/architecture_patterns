@@ -149,3 +149,84 @@ def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfW
 1. We commit even if we fail to allocate because the code is simpler this way and it's easier to reason about. We always commit unless something goes wrong. Committing when we haven't changed anything is safe and keeps the code uncluttered.
 
 * Option 3: The UoW Publishes Events to the Message Bus
+
+The UoW already has a try/finally, and it knows about all the aggregates currently in play because it provides access to the repository.
+So it's a good place to spot events and pass them to the message bus.
+
+
+#+BEGIN_SRC python
+# unit_of_work.py
+class AbstractUnitOfWork(abc.ABC):
+    # ...
+    def commit(self):
+        self._commit()  # 1
+        self.publish_events()  # 2
+
+    def publish_events(self):  # 2
+        for product in self.products.seen:  # 3
+            while product.events:
+                event = product.events.pop(0)
+                messagebus.handle(event)
+
+    @abc.abstractmethod
+    def _commit(self):
+        self.session.commit()
+#+END_SRC
+
+1. We'll change our commit method to require a private ._commit() method from subclasses
+2. After committing, we run through all the objects that our repository has seen and pass their events to the message bus
+3. That relies on the repository keeping track of aggregates that have been loaded using a new attribute, .seen
+
+#+BEGIN_SRC python
+# repository.py
+class AbstractRepository(abc.ABC):
+    def __init__(self):
+        self.seen = set()
+
+    def add(self, product: model.Product):
+        self._add(product)
+        self.seen.add(product)
+
+    def get(self, sku) -> model.Product:
+        product = self._get(sku)
+        if product:
+            self.seen.add(product)
+        return product
+
+    @abc.abstractmethod
+    def _add(self, product: model.Product):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _get(self, sku) -> model.Product:
+        raise NotImplementedError
+
+class SqlAlchemyRepository(AbstractRepository):
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+
+    def _add(self, product):
+        self.session.add(product)
+
+    def _get(self, sku):
+        return self.session.query(model.Product).filter_by(sku=sku).first()
+#+END_SRC
+
+* Domain Events and the Message Bus Recap
+
+** Events can help with the single responsibility principle
+Code gets tangled up when we mix multiple concerns in one place. Events can help us to keep things tidy by separating primary use cases from secondary ones. We also use events for communicating between aggregates so that we don't need to run long-running transactions that lock against multiple tables.
+
+** A message bus routes messages to handlers
+You can think of a message bus as a dict that maps from events to their consumers. It doesn't "know" anything about the meaning of events;
+it's just a piece of dumb infrastructure for getting messages around the system.
+
+** Option 1: Service layer raises events and passes them to the message bus
+The simplest way to start using events in your system is to raise them from handlers by calling bus.handle(some_new_event) after you commit your unit of work
+
+** Option 2: Domain model raises events, service layer passes them to message bus
+The logic about when to raise an event really should live with the model, so we can improve our system's design and testability by raising events from the domain model. It's easy for our handlers to collect events off the model objects after commit and pass them to the bus
+
+** Option 3: UoW collects events from aggregates and passes them to message bus
+Adding bus.handle(aggregate.events) to every handler is annoying, so we can tidy up by making our unit of work responsible for raising events that were raised by loaded objects. This is the most complex design, and might rely on ORM magic, but it's clean and easy to use once it's set up.
