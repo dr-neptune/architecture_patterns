@@ -1,1 +1,145 @@
 #+TITLE: Commands and Command Handler
+
+In the previous chapter, we used events as a way of representing the inputs to our system, and we turned out application into a message-processing machine.
+
+When the API receives a POST to create a new batch, it builds a new BatchCreated event and handles it as if it were an internal event.
+We are going to introduce commands and show how they can be handled by the same message bus, but with slightly different rules.
+
+* Commands and Events
+
+Like events, commands are a type of message. They are sent by one actor to another specific actor with the expectation that a particular thing will happen as a result. Commands capture intent. They express our wish for the system to do something. When they fail, the sender needs to receive error information. We name commands with imperative mood verb phrases like "allocate stock" or "delay shipment".
+
+Events are broadcast by an actor to all interested listeners. We name events with past-tense verb phrases like "order allocated to stock" or "shipment delayed". We often use events to spread the knowledge about successful commands. They capture facts about things that happened in the past.
+
+#+BEGIN_SRC python :tangle commands.py
+class Command:
+    pass
+
+
+@dataclass
+class Allocate(Command):
+    orderid: str
+    sku: str
+    qty: int
+
+
+@dataclass
+class CreateBatch(Command):
+    ref: str
+    sku: str
+    qty: int
+    eta: Optional[date] = None
+
+
+@dataclass
+class ChangeBatchQuantity(Command):
+    ref: str
+    qty: int
+#+END_SRC
+
+1. commands.Allocate will replace events.AllocationRequired
+2. commands.CreateBatch will replace events.BatchCreated
+3. commands.ChangeBatchQuantity will replace events.BatchQuantityChanged
+
+* Differences in Exception Handling
+
+Just changing the names and verbs is all very well, but that won't change the behavior of our system. We want to treat events and commands similarly, but not exactly the same.
+
+#+BEGIN_SRC python :tangle messagebus.py
+Message = Union[commands.Command, events.Event]
+
+EVENT_HANDLERS = {
+    events.OutOfStock: [handlers.send_out_of_stock_notification],
+}  # type: Dict[Type[events.Event], List[Callable]]
+
+COMMAND_HANDLERS = {
+    commands.Allocate: handlers.allocate,
+    commands.CreateBatch: handlers.add_batch,
+    commands.ChangeBatchQuantity: handlers.change_batch_quantity
+}  # type: Dict[Type[commands.Command], Callable]
+
+
+def handle(
+        message: Message,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    results = []
+    queue = [message]
+    while queue:
+        message = queue.pop(0)
+        if isinstance(message, events.Event):
+            handle_event(message, queue, uow)
+        elif isinstance(message, commands.Command):
+            cmd_result = handle_command(message, queue, uow)
+            results.append(cmd_result)
+        else:
+            raise Exception(f"{message} was not an Event or Command")
+    return results
+
+
+def handle_event(
+        event: events.Event,
+        queue: List[Message],
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    for handler in EVENT_HANDLERS[type(event)]:
+        try:
+            logger.debug("Handling event %s with handler %s", event, handler)
+            handler(event, uow=uow)
+            queue.extend(uow.collect_new_events())
+        except Exception:
+            logger.exception("Exception handling event %s", event)
+            continue
+
+
+def handle_command(
+        command: commands.Command,
+        queue: List[Message],
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    logger.debug("handling command %s", command)
+    try:
+        handler = COMMAND_HANDLERS[type(command)]
+        result = handler(command, uow=uow)
+        queue.extend(uow.collect_new_events())
+        return result
+    except Exception:
+        logger.exception("Exception handling command %s", command)
+        raise
+#+END_SRC
+
+* Events, Commands, and Error Handling
+
+When a user wants to make the system do something, we represent their request as a command. The command should modify a single aggregate and either succeed or fail in totality. Any other bookkeeping, cleanup, and notification we need to do can happen via an event. We don't require the event handlers to succeed in order for the command to be successful.
+
+* Recovering from Errors Synchronously
+
+The first thing we need is to know when an error has occurred, and for that we usually rely on logs.
+
+For most of the error cases, we can recover elegantly by trying again.
+
+#+BEGIN_SRC python
+from tenacity import Retrying, RetryError, stop_after_attempt, wait_exponential
+
+def handle_event(
+        event: events.Event,
+        queue: List[Message],
+        uow: unit_of_work.AbstractUnitOfWork,
+):
+    for handler in EVENT_HANDLERS[type(event)]:
+        try:
+            for attempt in Retrying(
+                    stop=stop_after_attempt(3),
+                    wait=wait_exponential()
+            ):
+                with attempt:
+                    logger.debug('handling event %s with handler %s', event, handler)
+                    handler(event, uow=uow)
+                    queue.extend(uow.collect_new_events())
+        except RetryError as retry_failure:
+            logger.error(
+                "Failed to handle event %s times, giving up!",
+                retry_failure.last_attempt.attempt_number
+            )
+            continue
+#+END_SRC

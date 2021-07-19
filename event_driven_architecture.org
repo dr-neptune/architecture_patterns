@@ -1,0 +1,20 @@
+#+TITLE: Event-Driven Architecture: Using Events to Integrate Microservices
+
+We have a microservice and a web API, but what about other ways of talking to other systems?
+
+In this chapter, we look at how the events metaphor can be extended to encompass the way that we handle incoming and outgoing messages from the system.
+Internally, the core of our application is now a message processor. We will follow through so that it becomes a message processor externally as well.
+
+We'll receive events from external sources via an external message bus and publish its outputs, in the form of events, back there as well.
+
+* The Alternative: Temporal Decoupling Using Asynchronous Messaging
+
+How do we get appropriate coupling?
+
+Instead of thinking about nouns as our pieces, we can think in terms of verbs. Our domain model is about modeling a business process -- it's not a static data model about a thing; it's a model of a verb.
+
+Like aggregates, microservices should be consistency boundaries. Between two services, we can accept eventual consistency, and that means we don't need to rely on synchronous calls. Each service accepts commands from the outside world and raises events to record the result. Other services can listen to those events to trigger the next steps in a workflow.
+
+To avoid the distributed big ball of mud antipattern, instead of temporally coupled HTTP API calls, we want to use asynchronous messaging to integrate our systems.
+
+* Using a Redis Pub/Sub Channel for Integration
