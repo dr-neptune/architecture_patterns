@@ -1,0 +1,3 @@
+#+TITLE: Command-Query Responsibility Segregation (CQRS)
+
+Reads (queries) and writes (commands) are different, so they should be treated differently (or have their responsibilities segregated).

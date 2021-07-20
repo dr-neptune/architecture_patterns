@@ -18,3 +18,129 @@ Like aggregates, microservices should be consistency boundaries. Between two ser
 To avoid the distributed big ball of mud antipattern, instead of temporally coupled HTTP API calls, we want to use asynchronous messaging to integrate our systems.
 
 * Using a Redis Pub/Sub Channel for Integration
+
+We need a way of getting events out of one system and into another, like a message bus, but for services. This piece of infrastructure is often called a message broker.
+The role of a message broker is to take messages from publishers and deliver them to subscribers.
+
+* Test-Driving it all using an End-to-End test
+
+#+BEGIN_SRC python :tangle test_external_events.py
+def test_change_batch_quantity_leading_to_reallocation():
+    # start with two batches and an order allocated to one of them
+    orderid, sku = random_orderid(), random_sku()
+    earlier_batch, later_batch = random_batchref("old"), random_batchref("newer")
+    api_client.post_to_add_batch(earlier_batch, sku, qty=10, eta="2011-01-01")
+    api_client.post_to_add_batch(later_batch, sku, qty=10, eta="2011-01-02")
+    response = api_client.post_to_allocate(orderid, sku, 10)
+    assert response.json()["batchref"] == earlier_batch
+
+    subscription = redis_client.subscribe_to("line_allocated")
+
+    # change quantity on allocated batch so it's less than our order
+    redis_client.publish_message(
+        "change_batch_quantity",
+        {"batchref": earlier_batch, "qty": 5}
+    )
+
+    # wait until we see a message saying the order has been reallocated
+    messages = []
+    for attempt in Retrying(stop=stop_after_delay(3), reraise=True):
+        with attempt:
+            message = subscription.get_message(timeout=1)
+            if message:
+                messages.append(message)
+                print(messages)
+            data = json.loads(messages[-1])["data"]
+            assert data["orderid"] == orderid
+            assert data["batchref"] == later_batch
+#+END_SRC
+
+* Redis is another Thin Adapter around our Message Bus
+
+Our Redis Pub/Sub listener (here claled an event consumer) is very much like Flask: it translates from the outside world to our events.
+
+#+BEGIN_SRC python :tangle redis_eventconsumer.py
+# simple Redis message listener
+r = redis.Redis(**config.get_redis_host_and_port())
+
+def main():
+    orm.start_mappers()
+    pubsub = r.pubsub(ignore_subscribe_messages=True)
+    pubsub.subscribe("change_batch_quantity")
+
+    for m in pubsub.listen():
+        handle_change_batch_quantity(m)
+
+def handle_change_batch_quantity(m):
+    logging.debug("handling %s", m)
+    data = json.loads(m["data"])
+    cmd = commands.ChangeBatchQuantity(ref=data["batchref"], qty=data["qty"])
+    messagebus.handle(cmd, uow=unit_of_work.SqlAlchemyUnitOfWork())
+#+END_SRC
+
+main() subscribes us to the change_batch_quantity channel on load.
+Our main job as an entrypoint to the system is to deserialize JSON, convert it to a Command, and pass it to the service layer -- much as the Flask adapter does.
+
+We also build a new downstream adapter to do the opposite job -- converting domain events to public events:
+
+#+BEGIN_SRC python :tangle redis_eventpublisher.py
+r = redis.Redis(**config.get_redis_host_and_port())
+
+def publish(channel, event: events.Event):
+    logging.debug("publishing: channel=%s, event=%s", channel, event)
+    r.publish(channel, json.dumps(asdict(event)))
+#+END_SRC
+
+* Our New Outgoing Event
+
+Here's what the Allocated event will look like:
+
+#+BEGIN_SRC python :tangle events.py
+@dataclass
+class Allocated(Event):
+    orderid: sku
+    sku: str
+    qty: int
+    batchref: str
+#+END_SRC
+
+We add it into our model's allocate() method
+
+#+BEGIN_SRC python :tangle model.py
+class Product:
+    # ...
+    def allocate(self, line: OrderLine) -> str:
+        # ...
+        batch.allocate(line)
+        self.version_number += 1
+        self.events.append(
+            events.Allocated(
+                orderid=line.orderid,
+                sku=line.sku,
+                qty=line.qty,
+                batchref=batch.reference
+            )
+        )
+        return batch.reference
+#+END_SRC
+
+#+BEGIN_SRC python :tangle messagebus.py
+# add another handler that publishes the outgoing event
+HANDLERS = {
+    events.Allocated: [handlers.publish_allocated_event],
+    events.OutOfStock: [handlers.send_out_of_stock_notification]
+}
+#+END_SRC
+
+#+BEGIN_SRC python :tangle handlers.py
+def publish_allocated_event(
+        event: events.Allocated,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    redis_eventpublisher.publish("line_allocated", event)
+#+END_SRC
+
+* Wrap-Up
+
+Events can come from the outside, but they can also be published externally -- our publish handler converts an event to a message on a Redis channel.
+We use events to talk to the outside world. This kind of temporal decoupling buys us a lot of flexibility in our application integrations.
