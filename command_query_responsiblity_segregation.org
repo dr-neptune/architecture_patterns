@@ -110,3 +110,137 @@ def test_allocations_view(sqlite_session_factory):
 #+END_SRC
 
 * Obvious Alternative 1: Using the Existing Repository
+
+How about adding a helper method to our products repository?
+
+#+BEGIN_SRC python :tangle views.py
+from allocation import unit_of_work
+
+def allocations(orderid: str, uow: unit_of_work.AbstractUnitOfWork):
+    with uow:
+        products = uow.products.for_order(orderid=orderid)  # 1
+        batches = [b for p in products for b in p.batches]  # 2
+        return [
+            {'sku': b.sku, 'batchref': b.reference}
+            for b in batches
+            if orderid in b.orderids  # 3
+        ]
+#+END_SRC
+
+1. Our repository returns Product objects, and we need to find all the products for the SKUs in a given order, so we'll build a new helper method called .for_order() on the repository
+2. Now we have products but we actually want batch references, so we get all the possible batches with a list comprehension
+3. We filter again to get just the batches for our specific order. That, in turn, relies on our Batch objects being able to tell us which order IDs it has allocated
+
+#+BEGIN_SRC python :tangle model.py
+class Batch:
+    # ...
+    @property
+    def orderids(self):
+        return {l.orderid for l in self._allocations}
+#+END_SRC
+
+* Obvious Alternative 2: Using the ORM
+
+#+BEGIN_SRC python :tangle views.py
+from allocation import unit_of_work, model
+
+def allocations():
+    with uow:
+        batches = uow.session.query(model.Batch).join(
+            model.OrderLine, model.Batch._allocations
+        ).filter(
+            model.OrderLine.orderid == orderid
+        )
+
+        return [
+            {"sku": b.sku, "batchref": b.batchref}
+            for b in batches
+        ]
+#+END_SRC
+
+* Time to Completely Jump the Shark
+
+First, a nicer SQL query:
+
+#+BEGIN_SRC python
+def allocations(orderid: str, uow: unit_of_work.SqlAlchemyUnitOfWork):
+    with uow:
+        results = uow.session.execute(
+            """
+            SELECT sku, batchref FROM allocations_view WHERE orderid = :orderid
+            """,
+            dict(orderid=orderid)
+        )
+#+END_SRC
+
+by keeping a totally separate, denormalized data store for our view model
+
+#+BEGIN_SRC python :tangle orm.py
+allocations_view = Table(
+    "allocations_view",
+    metadata,
+    Column("orderid", String(255)),
+    Column("sku", String(255)),
+    Column("batchref", String(255))
+)
+#+END_SRC
+
+Building a denormalized copy of your data that's optimized for read operations isn't uncommon, once you've reached the limits of what you can do with indexes.
+
+More than raw speed, this approach buys us scale. When we're _reading_ data, there is no limit to the number of clients that can concurrently execute. For this reason, read-only stores can be horizontally scaled out.
+
+Keeping the read model up to date is the challenge! Database views (materialized or otherwise) and triggers are a common solution, but that limits us to our database.
+
+Instead, we'd like to look at how to reuse event-driven architecture instead
+
+* Updating a Read Model Table Using an Event Handler
+
+We add a second handler to the Allocated event:
+
+#+BEGIN_SRC python :tangle messagebus.py
+EVENT_HANDLERS = {
+    events.Allocated: [
+        handlers.publish_allocated_event,
+        handlers.add_allocation_to_read_model,
+    ],
+    events.Deallocated: [
+        handlers.remove_allocation_from_read_model,
+        handlers.reallocate
+    ]
+}
+#+END_SRC
+
+Then we change our update-view-model code:
+
+#+BEGIN_SRC python :tangle handlers.py
+def add_allocation_to_read_model(
+        event: events.Allocated,
+        uow: unit_of_work.SqlAlchemyUnitOfWork
+):
+    with uow:
+        uow.session_execute(
+            """
+            INSERT INTO allocations_view (orderid, sku, batchref)
+            VALUES (:orderid, :sku, :batchref)
+            """,
+            dict(orderid=event.orderid,
+                 sku=event.sku,
+                 batchref=event.batchref)
+        )
+        uow.commit()
+
+def remove_allocation_from_read_model(
+        event: events.Deallocated,
+        uow: unit_of_work.SqlAlchemyUnitOfWork
+):
+    with uow:
+        uow.session.execute(
+            """
+            DELETE FROM allocations_view
+            WHERE orderid = :orderid AND sku = :sku
+            """,
+            dict(orderid=event.orderid,
+                 sku=event.sku)
+        )
+        uow.commit()
+#+END_SRC
