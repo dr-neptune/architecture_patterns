@@ -1,1 +1,366 @@
 #+TITLE: Dependency Injection (and Bootstrapping)
+
+In this chapter, we'll explore some of the pain points in our code that lead us to consider using dependency injection, and we'll present some options for how to do it.
+
+* Implicit vs. Explicit Dependencies
+
+In our code so far, we have been explicitly passing around unit of works. This is very explicit. In python, we could just as easily hide that detail by importing it and removing the explicit dependency.
+
+The trade-off is that we might get overrun with mocks with tests if we are doing a lot of mocking.
+
+* Preparing Handlers: Manual DI with Closures and Partials
+
+One way to turn a function with dependencies into one that's ready to be called later with those dependencies already injected is to use closures or partial functions to compose the function with its dependencies:
+
+#+BEGIN_SRC python
+# existing allocate function, with abstract uow dependency
+def allocate(
+        cmd: commands.Allocate,
+        uow: unit_of_work.AbstractUnitOfWork
+):
+    line = OrderLine(cmd.orderid, cmd.sku, cmd.qty)
+    with uow:
+        # ...
+        pass
+
+
+# bootstrap script prepares actual UoW
+def bootstrap(..):
+    uow = unit_of_work.SqlAlchemyUnitOfWork()
+
+    # prepare a version of the allocate fn with UoW dependency captured in a closure
+    allocate_composed = lambda cmd: allocate(cmd, uow)
+
+    # alternatively with a partial
+    import functools
+    allocate_composed = functools.partial(allocate, uow=uow)
+
+    return allocate_composed
+
+
+# later at runtime, we can call the partial function, and it will have the UoW already bound
+allocate_composed(cmd)
+#+END_SRC
+
+* An Alternative Using Classes
+
+#+BEGIN_SRC python
+# we replace the old 'def allocate(cmd, uow)' with
+class AllocateHandler:
+    def __init__(self, uow: unit_of_work.AbstractUnitOfWork):
+        self.uow = uow
+
+    def __call__(self, cmd: commands.Allocate):
+        line = OrderLine(cmd.orderid, cmd.sku, cmd.qty)
+        with self.uow:
+            # rest of handler as mentioned before
+            pass
+
+# boostrap script prepares actual UoW
+uow = unit_of_work.SqlAlchemyUnitOfWork()
+
+# then prepares a version of the allocate fn with dependencies already injected
+allocate = AllocateHandler(uow)
+
+# later at runtime, we can call the handler instance and it will have the UoW already injected
+allocate(cmd)
+#+END_SRC
+
+* A Bootstrap Script
+
+We want our bootstrap script to do the following:
+
+1. Declare default dependencies but allow us to override them
+2. Do the "init" stuff that we need to get our app started
+3. Inject all the dependencies into our handlers
+4. Give us back the core object for our app, the message bus
+
+#+BEGIN_SRC python :tangle bootstrap.py
+def bootstrap(
+        start_orm: bool = True,
+        uow: unit_of_work.AbstractUnitOfWork = unit_of_work.SqlAlchemyUnitOfWork(),
+        send_mail: Callable = email.send,
+        publish: Callable = redis_eventpublisher.publish
+) -> messagebus.MessageBus:
+    if start_orm:
+        orm.start_mappers()
+
+    dependencies = {"uow": uow,
+                    "send_mail": send_mail.
+                    "publish": publish}
+
+    injected_event_handlers = {
+        event_type: [
+            inject_dependencies(handler, dependencies)
+            for handler in event_handlers
+        ]
+        for event_type, event_handlers in handlers.EVENT_HANDLERS.items()
+    }
+
+    injected_command_handlers = {
+        command_type: inject_dependencies(handler, dependencies)
+        for command_type, handler in handlers.COMMAND_HANDLERS.items()
+    }
+
+    return messagebus.MessageBus(
+        uow=uow,
+        event_handlers=injected_event_handlers,
+        command_handlers=injected_command_handlers
+    )
+
+def inject_dependencies(handler, dependencies):
+    params = inspect.signature(handler).parameters
+    deps = {
+        name: dependency
+        for name, dependency in dependencies.items()
+        if name in params
+    }
+    return lambda message: handler(message, **deps)
+#+END_SRC
+
+* Message Bus is Given Handlers at Runtime
+
+Our messagebus will no longer be static; it needs to have the already injected handlers given to it.
+
+#+BEGIN_SRC python
+class MessageBus:
+    def __init__(self,
+                 uow: unit_of_work.AbstractUnitOfWork,
+                 event_handlers: Dict[Type[events.Event], List[Callable]],
+                 command_handlers: Dict[Type[commands.Command], Callable]):
+        self.uow = uow
+        self.event_handlers = event_handlers
+        self.command_handlers = command_handlers
+
+    def handle(self, message: Message):
+        self.queue = [message]
+        while self.queue:
+            message = self.queue.pop(0)
+            if isinstance(message, events.Event):
+                self.handle_event(message)
+            elif isinstance(message, commands.Command):
+                self.handle_command(message)
+            else:
+                raise Exception(f"{message} was not an Event or Command")
+
+    def handle_event(self, event: events.Event):
+        for handler in self.event_handlers[type(event)]:
+            try:
+                logger.debug("handling event %s with handler %s", event, handler)
+                handler(event)
+                self.queue.extend(self.uow.collect_new_events())
+            except Exception:
+                logger.exception("Exception handling event %s", event)
+                continue
+
+    def handle_command(self, command: commands.Command):
+        logger.debug("handling command %s", command)
+        try:
+            handler = self.command_handlers[type(command)]
+            handler(command)
+            self.queue.extend(self.uow.collect_new_events())
+        except Exception:
+            logger.exception("Exception handling command %s", command)
+            raise
+#+END_SRC
+
+* Initializing DI in Our Tests
+
+In tests, we can use bootstrap.bootstrap() with overridden defaults to get a custom message bus.
+
+#+BEGIN_SRC python :tangle test_views.py
+@pytest.fixture
+def sqlite_bus(sqlite_session_factory):
+    bus = bootstrap.bootstrap(
+        start_orm=True,
+        uow=unit_of_work.SqlAlchemyUnitOfWork(sqlite_session_factory),
+        send_mail=lambda *args: None,
+        publish=lambda *args: None
+    )
+    yield bus
+    clear_mappers()
+
+def test_allocations_view(sqlite_bus):
+    sqlite_bus.handle(commands.CreateBatch("sku1batch", "sku1", 50, None))
+    sqlite_bus.handle(commands.CreateBatch("sku2batch", "sku2", 50, today))
+    # ...
+    assert views.allocations("order1", sqlite_bus.uow) == [
+        {"sku": "sku1", "batchref": "sku1batch"},
+        {"sku": "sku2", "batchref": "sku2batch"}
+    ]
+#+END_SRC
+
+In the above snippet:
+
+1. We still want to start the ORM
+2. We are using a real UoW, just with an in memory database
+3. We don't need email or publish, so we make these noops
+
+#+BEGIN_SRC python :tangle test_handlers.py
+def bootstrap_test_app():
+    return bootstrap.bootstrap(
+        start_orm=False,
+        uow=FakeUnitOfWork(),
+        send_mail=lambda *args: None,
+        publish=lambda *args: None
+    )
+#+END_SRC
+
+In our unit tests:
+1. No need to start the ORM
+2. since the fake UoW doesn't use one
+3. We want to fake out our email and Redis adapters too
+
+* Building an Adapter "Properly": A Worked Example
+
+To get a feel for how it all works, let's work through an example of how we might properly build an adapter and do dependency injections for it.
+
+Currently, we have 2 types of dependencies:
+
+1. The UoW has an abstract base class. This is the heavyweight option for declaring and managing our external dependency. We use this for the case wehn the dependency is relatively complex
+2. Our email sender and pub/sub publisher are defined as functions. This works fine for simple dependencies
+
+We will use send_mail as an example
+
+* Define the Abstract and Concrete Implementations
+
+We'll imagine a mroe generic notifications API. Could be email, could be SMS, could be Slack posts one day.
+
+#+BEGIN_SRC python :tangle notifications.py
+class AbstractNotification(abc.ABC):
+    @abc.abstractmethod
+    def send(self, destination, message):
+        raise NotImplementedError
+
+class EmailNotifications(AbstractNotifications):
+    def __init__(self, smtp_host=DEFAULT_HOST, port=DEFAULT_PORT):
+        self.server = smtplib.SMTP(stmp_host, port=port)
+        self.server.noop()
+
+    def send(self, destination, message):
+        msg = f"Subject: allocation service notification\n{message}"
+        self.server.sendmail(
+            from_addr="allocations@example.com",
+            to_addrs=[destination],
+            msg=msg
+        )
+#+END_SRC
+
+Then we change the dependency in our bootstrap script:
+
+#+BEGIN_SRC python :tangle bootstrap.py
+def bootstrap(
+        start_orm: bool = True,
+        uow: unit_of_work.AbstractUnitOfWork = unit_of_work.SqlAlchemyUnitOfWork(),
+        notifications: AbstractNotifications = EmailNotifications(),  # this is the new piece!
+        publish: Callable = redis_eventpublisher.publish
+) -> messagebus.MessageBus:
+    pass
+#+END_SRC
+
+* Make a Fake Version for your Tests
+
+#+BEGIN_SRC python
+class FakeNotifications(notifications.AbstractNotifications):
+    def __init__(self):
+        self.sent = defaultdict(list)
+
+    def send(self, destination, message):
+        self.sent[destination].append(message)
+
+# and use it in our tests
+# ...
+def test_sends_email_on_out_of_stock_error():
+    fake_notifs = FakeNotifications()
+    bus = bootstrap.bootstrap(
+        start_orm=False,
+        uow=FakeUnitOfWork(),
+        notifications=fake_notifs,
+        publish=lambda *args: None,
+    )
+    bus.handle(commands.CreateBatch("b1", "POPULAR-CURTAINS", 9, None))
+    bus.handle(commands.Allocate("o1", "POPULAR-CURTAINS", 10))
+    assert fake_notifs.sent["stock@made.com"] == [
+        f"Out of stock for POPULAR-CURTAINS"
+    ]
+#+END_SRC
+
+* Figure Out How to Integration Test the Real Thing
+
+#+BEGIN_SRC yml :tangle docker-compose.yml
+version: "3"
+
+services:
+
+  redis_pubsub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: allocation-image
+
+    api:
+      image: allocation-image
+      # ...
+
+    postgres:
+      image: postgres: 9.6
+      # ...
+
+    redis:
+      image: redis:alpine
+      # ...
+
+    mailhog:
+      image: mailhog/mailhog
+      ports:
+        - "11025:1025"
+        - "18025:8025"
+#+END_SRC
+
+In our integration tests, we use the real EmailNotifications class, talking to the MailHog server in the Docker cluster:
+
+#+BEGIN_SRC python :tangle test_email.py
+@pytest.fixture
+def bus(sqlite_session_factory):
+    bus = bootstrap.bootstrap(
+        start_orm=True,
+        uow=unit_of_work.SqlAlchemyUnitOfWork(sqlite_session_factory),
+        notifications=notifications.EmailNotifications(),
+        publish=lambda *args: None
+    )
+    yield bus
+    clear_mappers()
+
+def get_email_from_mailhog(sku):
+    host, port = map(config.get_email_host_and_port().get, ["host", "http_port"])
+    all_emails = requests.get(f"http://{host}:{port}/api/v2/messages").json()
+    return next(m for m in all_emails["items"] if sku in str(m))
+
+def test_out_of_stock_email(bus):
+    sku = random_sku()
+    bus.handle(commands.CreateBatch("batch1", sku, 9, None))
+    bus.handle(commands.Allocate("order1", sku, 10))
+    email = get_email_from_mailhog(sku)
+    assert email["Raw"]["From"] == "allocations@example.com"
+    assert email["Raw"]["To"] == ["stock@made.com"]
+    assert f"Out of stock for {sku}" in email["Raw"]["Data"]
+#+END_SRC
+
+* Wrap-Up
+
+- Once we have more than one adapter, we'll start to feel a lot of pain from passing dependencies around manually unless we do some kind of dependency injection
+- Setting up dependency injection is just one of the typical setup/initialization activities that we need to do just once when starting our app. Putting this
+  into a boostrap script is often a good idea.
+- The bootstrap script is also a good place to provide sensible default configuration for our adapters, and as a single place to override those adapters with
+  fakes for our tests
+- If we find ourselves needing DI at multiple levels, its a good idea to use a DI framework
+
+
+** DI and Bootstrap Recap:
+
+1. Define our API using an ABC
+2. Implement the real thing
+3. Build a fake and use it for unit/service-layer/handler tests
+4. Find a less fake version and put it in a docker env
+5. Test the less fake "real" thing
+6. Profit!
