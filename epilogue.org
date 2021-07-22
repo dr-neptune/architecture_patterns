@@ -1,0 +1,44 @@
+#+TITLE: Epilogue
+
+* How Do I Get There From Here?
+
+Having a clear goal in mind will help to prioritize work that needs to be done and communicate why it should be done to the rest of the team.
+
+Making complex changes to a system is often easier if you link it to feature work. With a 6 month project to deliver, it's easier to make the
+argument for 3 weeks of cleanup work. Bob (from the book) refers to this as architecture tax.
+
+* Separating Entangled Responsibilities
+
+Start by working out the use cases of your system. Each of your use cases needs to have an imperative name: Apply Billing Charges, Clean Abandoned Accounts, Raise Purchase Order, etc.
+
+We aim to create a single function or class for each of these supported operations that deals with orchestrating the work to be done.
+Each use case should do the following:
+
+- start its own database transaction if needed
+- fetch any required data
+- check any preconditions
+- update the domain model
+- persist any changes
+
+Each use case should succeed or fail as an atomic unit. You might need to call one use case from another. Thats ok, just make a note of it, and try
+to avoid long-running database transactions.
+
+This is also a good opportunity to pull any data-access or orchestration code out of the domain model and into the use cases.
+We should also try to pull I/O concerns (e.g. sending email, writing files) out of the domain model and up into the use-case functions.
+
+* Identifying Aggregates and Bounded Contexts
+
+Aggregates are a consistency boundary. In general, each use case should update a single aggregate at a time. One handler fetches one aggregate from a repository,
+modifies its state, and raises any events that happen as a result. If you need data from another part of the system, it's totally fine to use a read model, but
+avoid updating multiple aggregates in a single transaction. When we choose to separate code into different aggregates, we're explicitly choosing to make them
+eventually consistent with one another.
+
+* An Event-Driven Approach to Go to Microservices via Strangler Pattern
+
+The Strangler Fig pattern involves creating a new system around the edges of an old system, while keeping it running. Bits of old functionality are gradually intercepted
+and replaced, until the old system is left doing nothing at all and can be switched off.
+
+When building the availability service, a technique called event interception moved functionality from one place to another:
+1. Raise events to represent the changes happening in a system we want to replace
+2. Build a second system that consumes those events and uses them to build its own domain model
+3. Replace the older system with the new
